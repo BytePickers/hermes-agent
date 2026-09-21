@@ -255,7 +255,7 @@ def _file_version(resolved: str) -> tuple | None:
     try:
         if not stat.S_ISREG(os.stat(resolved).st_mode):
             return None
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
         with os.fdopen(fd, "rb") as stream:
             before = os.fstat(stream.fileno())
             if not stat.S_ISREG(before.st_mode):
