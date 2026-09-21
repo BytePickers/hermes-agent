@@ -1170,62 +1170,14 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     return scratch
 
 
-def _subtree_touched_since(path: Path, cutoff: float) -> bool:
-    """True when *path* or anything beneath it has an mtime at or after *cutoff*.
-
-    Stops at the first recent entry, so a live tree costs one hit and only a truly idle
-    tree pays for the full walk (once, right before it is deleted). Symlinks are never
-    followed: a link into the repo would make the target's activity keep the entry alive.
-    """
-    try:
-        if os.lstat(path).st_mtime >= cutoff:
-            return True
-    except OSError:
-        return False
-    if not path.is_dir() or path.is_symlink():
-        return False
-    stack = [str(path)]
-    while stack:
-        try:
-            with os.scandir(stack.pop()) as it:
-                for child in it:
-                    try:
-                        if child.stat(follow_symlinks=False).st_mtime >= cutoff:
-                            return True
-                    except OSError:
-                        continue
-                    if child.is_dir(follow_symlinks=False):
-                        stack.append(child.path)
-        except OSError:
-            continue
-    return False
-
-
 def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float = SCRATCH_MAX_IDLE_HOURS) -> int:
     """Delete top-level scratch entries with no write anywhere in their subtree for
-    *max_idle_hours*; return the count removed."""
-    import time
+    *max_idle_hours*, reaping processes and git worktree registrations rooted in them
+    first (``hermes_constants_scratch``); return the count removed."""
+    from hermes_constants_scratch import prune_idle_entries
+
     root = scratch if scratch is not None else get_scratch_dir(prune=False)
-    cutoff = time.time() - max_idle_hours * 3600
-    removed = 0
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return 0
-    for entry in entries:
-        if entry.name == _SCRATCH_PRUNE_STAMP:
-            continue
-        try:
-            if _subtree_touched_since(entry, cutoff):
-                continue
-            if entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
-                entry.unlink()
-            removed += 1
-        except OSError:
-            continue
-    return removed
+    return prune_idle_entries(root, max_idle_hours, frozenset({_SCRATCH_PRUNE_STAMP}))
 
 
 def _prune_scratch_dir_once(scratch: Path) -> None:

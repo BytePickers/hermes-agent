@@ -165,6 +165,31 @@ def _check_directory_structure(should_fix: bool, f: Finding) -> None:
             check_info(f"{fname} not created yet (will be created when the agent first writes a memory)")
 
 
+# Cache-root entries at least this big that no pruner covers get a doctor warning.
+_UNPRUNED_CACHE_WARN_BYTES = 1 << 30
+_PRUNED_CACHE_DIRS = frozenset({"scratch", "terminal"})
+
+
+def unpruned_cache_hogs(hermes_home: Path, min_bytes: int = _UNPRUNED_CACHE_WARN_BYTES) -> list[tuple[str, int]]:
+    """``(name, bytes)`` for ``cache/`` entries outside the pruned dirs that exceed *min_bytes*.
+
+    Finished campaign trees parked at the cache root sat for weeks (95 GB on one host)
+    because only ``scratch/`` and ``terminal/`` are reaped; doctor is where that shows."""
+    from hermes_constants import scratch_dir_usage_bytes
+
+    cache = hermes_home / "cache"
+    hogs: list[tuple[str, int]] = []
+    try:
+        entries = [e for e in cache.iterdir() if e.is_dir() and not e.is_symlink() and e.name not in _PRUNED_CACHE_DIRS]
+    except OSError:
+        return hogs
+    for entry in entries:
+        size = scratch_dir_usage_bytes(entry)
+        if size >= min_bytes:
+            hogs.append((entry.name, size))
+    return sorted(hogs, key=lambda item: -item[1])
+
+
 def _check_scratch_dir(hermes_home: Path, _DHH: str) -> None:
     """Report the scratch dir (TMPDIR target) and its size; a user-set TMPDIR elsewhere is shown, not judged."""
     from hermes_constants import (
@@ -172,6 +197,12 @@ def _check_scratch_dir(hermes_home: Path, _DHH: str) -> None:
     scratch = get_scratch_dir(hermes_home, prune=False)
     size = _human_bytes(scratch_dir_usage_bytes(scratch))
     check_ok(f"{_DHH}/cache/scratch/ is the scratch dir (TMPDIR; {size}, entries pruned after {SCRATCH_MAX_IDLE_HOURS}h idle)")
+    for name, nbytes in unpruned_cache_hogs(hermes_home):
+        check_warn(
+            f"{_DHH}/cache/{name}/ is {_human_bytes(nbytes)} and outside every pruner "
+            f"(only cache/scratch/ and cache/terminal/ are reaped) — move task files under "
+            f"cache/scratch/<task>/ or delete it"
+        )
     tmpdir = os.environ.get("TMPDIR", "")
     if tmpdir and tmpdir != os.environ.get(SCRATCH_DIR_MARKER_ENV, ""):
         check_info(f"TMPDIR={tmpdir} is set by you or the OS, so Hermes leaves it alone")
