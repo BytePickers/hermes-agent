@@ -46,16 +46,23 @@ def test_bootstrap_import_exports_scratch_to_process_and_children(tmp_path):
     assert out.stdout.split() == [expected, expected]
 
 
-def test_prune_removes_only_stale_top_level_entries(tmp_path):
+def test_prune_removes_idle_entries_and_keeps_trees_written_deep_inside(tmp_path):
+    """Idle retention: an entry goes when nothing in its subtree was written within the window;
+    a tree whose only recent write is three levels down is still in use and stays, even though
+    its top-level mtime is ancient (a directory's mtime ignores writes below its children)."""
     scratch = get_scratch_dir(tmp_path, prune=False)
-    stale, fresh = scratch / "stale", scratch / "fresh.txt"
-    stale.mkdir()
-    (stale / "f").write_text("x", encoding="utf-8")
+    idle, live, fresh = scratch / "idle", scratch / "live", scratch / "fresh.txt"
+    deep = live / "lane" / "wt"
+    deep.mkdir(parents=True)
+    idle.mkdir()
+    (idle / "f").write_text("x", encoding="utf-8")
+    (deep / "log").write_text("x", encoding="utf-8")
     fresh.write_text("y", encoding="utf-8")
-    ancient = time.time() - 100 * 3600
-    os.utime(stale, (ancient, ancient))
+    ancient = time.time() - 30 * 3600
+    for path in (idle, idle / "f", live, live / "lane", deep):
+        os.utime(path, (ancient, ancient))
     assert prune_scratch_dir(scratch) == 1
-    assert not stale.exists() and fresh.exists()
+    assert not idle.exists() and live.exists() and fresh.exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")
