@@ -155,6 +155,10 @@ class ProfileRow(Result):
     description: str = ""
     display_name: str = ""
     skill_count: int = 0
+    # Renamed-profile history: ``hermes profile rename`` records the old names in profile.yaml
+    # and the serializer has surfaced them on profiles.list since #110200 (group chats re-seat
+    # stale member descriptors through it).
+    previous_names: list[str] = Field(default_factory=list)
     last_session: ProfileSessionPreview | None = None
     worker_session: ProfileWorkerSession | None = None
     canonical_session: ProfileCanonicalSession | None = None
