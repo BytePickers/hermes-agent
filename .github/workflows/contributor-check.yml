@@ -25,7 +25,15 @@ jobs:
         id: check-emails
         run: |
           # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Sweep only THIS PR's own commits: merge-base against the PR's base
+          # branch (fallback main for push runs). A hardcoded origin/main
+          # merge-base also sweeped unrelated deploy-line-only history on
+          # non-main PRs and failed every deploy-line PR with unmapped
+          # upstream authors (PR #106, #108, #111) — authors whose commits
+          # predate the PR and are not its contributors.
+          BASE_REF="${{ github.event.pull_request.base.ref || 'main' }}"
+          git fetch origin "${BASE_REF}" --quiet 2>/dev/null || true
+          MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD 2>/dev/null || git merge-base origin/main HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
