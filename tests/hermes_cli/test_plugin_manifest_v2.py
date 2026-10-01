@@ -736,3 +736,106 @@ class TestUserKeyCollisionFailLoud:
         assert self._collision_records(caplog) == []
         assert mgr._plugins["overridable"].manifest.source == "user"
         assert "shadows the bundled copy" in caplog.text
+
+
+class TestCrossSourceOverrideIsNotACollision:
+    """A ``user`` and a ``project`` manifest claiming the same key is the documented precedence order
+    (project > user > bundled): a deliberate project-local override of a personal plugin loads without
+    the stale-copy collision WARNING. Only a same-SOURCE duplicate (user-vs-user, project-vs-project)
+    at a different path is a race worth announcing."""
+
+    COLLISION_LOGGER = "hermes_cli.plugins.collisions"
+
+    @staticmethod
+    def _collision_records(caplog) -> list:
+        return [r for r in caplog.records
+                if r.name == TestCrossSourceOverrideIsNotACollision.COLLISION_LOGGER
+                and r.levelno == logging.WARNING]
+
+    @staticmethod
+    def _enable_project_plugins(tmp_path, monkeypatch):
+        project = tmp_path / "project-root"
+        (project / ".hermes" / "plugins").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        monkeypatch.chdir(project)
+        return project
+
+    def test_project_override_of_user_plugin_loads_without_collision_warning(
+            self, hermes_home, monkeypatch, caplog):
+        """The project copy overrides the personal plugin on purpose: the documented precedence decides
+        silently — the stale-copy advice would be a false alarm here."""
+        _write_plugin(hermes_home / "plugins", "statusboard",
+                      register_body="import sys; sys._override_probe = 'user'")
+        project = self._enable_project_plugins(hermes_home.parent, monkeypatch)
+        project_copy = _write_plugin(project / ".hermes" / "plugins", "statusboard",
+                                     manifest_extra={"version": "1.1.0"},
+                                     register_body="import sys; sys._override_probe = 'project'")
+        _enable(hermes_home, ["statusboard"])
+        import sys
+        try:
+            with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+                mgr = PluginManager()
+                mgr.discover_and_load()
+            assert self._collision_records(caplog) == []
+            assert mgr._plugins["statusboard"].manifest.source == "project"
+            assert mgr._plugins["statusboard"].manifest.path == str(project_copy)
+            assert sys._override_probe == "project"
+        finally:
+            if hasattr(sys, "_override_probe"):
+                delattr(sys, "_override_probe")
+
+    def test_project_local_duplicate_paths_still_warn(self, hermes_home, monkeypatch, caplog):
+        """The project half of the same-source rule: two project manifests racing for one key are
+        announced exactly like the user-vs-user race (one WARNING, both paths, winner named)."""
+        project = self._enable_project_plugins(hermes_home.parent, monkeypatch)
+        live = _write_plugin(project / ".hermes" / "plugins", "statusboard",
+                             register_body="import sys; sys._override_probe = 'live'")
+        stale = _write_plugin(project / ".hermes" / "plugins", "statusboard.bak-alt",
+                              manifest_extra={"name": "statusboard"},
+                              register_body="import sys; sys._override_probe = 'stale'")
+        _enable(hermes_home, ["statusboard"])
+        import sys
+        try:
+            with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+                mgr = PluginManager()
+                mgr.discover_and_load()
+            records = self._collision_records(caplog)
+            assert len(records) == 1
+            message = records[0].getMessage()
+            assert message.index(str(live)) < message.index(str(stale))
+            assert mgr._plugins["statusboard"].manifest.path == str(stale)
+            assert sys._override_probe == "stale"
+        finally:
+            if hasattr(sys, "_override_probe"):
+                delattr(sys, "_override_probe")
+
+    def test_user_race_with_project_override_warns_about_the_user_race(
+            self, hermes_home, monkeypatch, caplog):
+        """A user-vs-user duplicate racing alongside a deliberate project override: exactly one WARNING
+        for the user race — the override shows up in the ladder and as the winner, tagged [project]."""
+        live = _write_plugin(hermes_home / "plugins", "statusboard",
+                             register_body="import sys; sys._override_probe = 'user-live'")
+        stale = _write_plugin(hermes_home / "plugins", "statusboard.bak-alt",
+                              manifest_extra={"name": "statusboard"},
+                              register_body="import sys; sys._override_probe = 'user-stale'")
+        project = self._enable_project_plugins(hermes_home.parent, monkeypatch)
+        project_copy = _write_plugin(project / ".hermes" / "plugins", "statusboard",
+                                     manifest_extra={"version": "2.0.0"},
+                                     register_body="import sys; sys._override_probe = 'project'")
+        _enable(hermes_home, ["statusboard"])
+        import sys
+        try:
+            with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+                mgr = PluginManager()
+                mgr.discover_and_load()
+            records = self._collision_records(caplog)
+            assert len(records) == 1
+            message = records[0].getMessage()
+            assert message.index(str(live)) < message.index(str(stale)) < message.index(str(project_copy))
+            assert "[user] -> " in message and "[project]" in message
+            assert message.split("loading", 1)[1].lstrip().startswith(str(project_copy))
+            assert mgr._plugins["statusboard"].manifest.path == str(project_copy)
+            assert sys._override_probe == "project"
+        finally:
+            if hasattr(sys, "_override_probe"):
+                delattr(sys, "_override_probe")
