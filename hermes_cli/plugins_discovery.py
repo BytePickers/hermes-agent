@@ -25,6 +25,10 @@ from hermes_cli.plugins_manifest import (
 from hermes_cli.relay_plugin_cutover import LEGACY_RELAY_PLUGIN_KEYS, RELAY_PLUGINS_CONFIG_ENV
 
 logger = logging.getLogger("hermes_cli.plugins")
+# Dedicated channel for same-key collisions between user-controlled manifests: operator alerting can
+# watch this logger name alone instead of parsing the general plugin log. Propagates to the parent
+# logger, so the lines still land in the normal log sinks.
+collision_logger = logging.getLogger("hermes_cli.plugins.collisions")
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
@@ -218,17 +222,28 @@ def collect_directory_manifests() -> List[PluginManifest]:
     return manifests
 
 
+# Sources whose manifests compete in one user-editable namespace: two of them claiming the same key
+# from different paths is a collision (a stale backup copy re-activating), not a documented override.
+_USER_CONTROLLED_SOURCES = frozenset({"user", "project"})
+
+
 def resolve_manifest_winners(manifests: List[PluginManifest]) -> Dict[str, PluginManifest]:
     """Later sources win on key collision (project > user > bundled): a same-named copy under
     ``~/.hermes/plugins/<name>`` is the documented way to override a bundled plugin, and is logged. A flat
     user/project manifest that claims a bundled key from a *differently named* directory is an impostor, not
     an override (``impostor_dir/plugin.yaml`` with ``name: kanban``): it is skipped with a warning so
-    ``hermes plugins enable kanban`` never activates unrelated code under the bundled name."""
+    ``hermes plugins enable kanban`` never activates unrelated code under the bundled name.
+    Two user-controlled manifests (``user``/``project``) claiming the SAME key from different paths are
+    neither of those: the last one in discovery order silently wins (behavior unchanged — a stale
+    ``*.bak``-style copy sorting after the live directory would re-activate old code), so each such
+    collision is announced on the ``hermes_cli.plugins.collisions`` logger as a WARNING naming the key,
+    every competing path in discovery order and the manifest that wins under that rule."""
     winners: Dict[str, PluginManifest] = {}
+    claimed: Dict[str, List[PluginManifest]] = {}
     for manifest in manifests:
         key = manifest_key(manifest)
         shadowed = winners.get(key)
-        if shadowed is not None and shadowed.source == "bundled" and manifest.source in {"user", "project"}:
+        if shadowed is not None and shadowed.source == "bundled" and manifest.source in _USER_CONTROLLED_SOURCES:
             own_dir = Path(manifest.path).name if manifest.path else ""
             bundled_dir = Path(shadowed.path).name if shadowed.path else ""
             if own_dir and bundled_dir and own_dir != bundled_dir:
@@ -241,7 +256,33 @@ def resolve_manifest_winners(manifests: List[PluginManifest]) -> Dict[str, Plugi
             logger.info("Plugin '%s' at %s (%s) shadows the bundled copy at %s", key, manifest.path,
                         manifest.source, shadowed.path)
         winners[key] = manifest
+        claimed.setdefault(key, []).append(manifest)
+    _warn_user_key_collisions(claimed, winners)
     return winners
+
+
+def _warn_user_key_collisions(
+    claimed: Dict[str, List[PluginManifest]], winners: Dict[str, PluginManifest]
+) -> None:
+    """Announce every same-key race between two user-controlled manifests, once per key per discovery.
+    Flat manifests take their registry key from the manifest ``name:`` field, so a backup/hand copy of a
+    plugin directory (``myplugin.bak-…``) enters the same race as the live directory and last-in-order
+    (``sorted(path.iterdir())``) decides it silently. One WARNING per colliding key is the counter: silence
+    means no race, N warnings mean N keys were raced."""
+    for key, candidates in claimed.items():
+        user_candidates = [m for m in candidates if m.source in _USER_CONTROLLED_SOURCES]
+        if len(user_candidates) < 2 or len({m.path for m in user_candidates}) < 2:
+            continue
+        winner = winners.get(key)
+        collision_logger.warning(
+            "Plugin key '%s' is claimed by %d user/project manifests at different paths (discovery order: "
+            "%s); last-in-order wins, loading %s%s — rename or remove the stale copy so the intended "
+            "plugin loads",
+            key, len(user_candidates),
+            " -> ".join(f"{m.path} [{m.source}]" for m in candidates),
+            winner.path if winner is not None else "<none>",
+            f" (version {winner.version})" if winner is not None and winner.version else "",
+        )
 
 
 @dataclass(frozen=True)
