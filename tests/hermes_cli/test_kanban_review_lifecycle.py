@@ -929,3 +929,129 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+def test_active_pr_guard_lifts_when_dependency_repromotes_after_pr_comment(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dependency re-promotion AFTER the PR comment releases ``active_pr``.
+
+    t_9705e32e: a run that ended cleanly in dependency-wait (outcome
+    ``blocked``, no crash) leaves its plan-PR comment on the card. When the
+    dependency resolves, the card is re-promoted (``promoted``/``unblocked``
+    event strictly after the comment) — that re-queue is the deliberate
+    "run it now" intent and must release the 24h ``active_pr`` hold, exactly
+    like the ``recent_success`` bypass it mirrors. Without this, a
+    blocked-then-promoted card sits startable-but-unclaimed for the whole PR
+    window while the dispatcher logs ``respawn_guarded active_pr`` every tick.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config", lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    pr_comment = (
+        "Plan submitted: https://github.com/example/repo/pull/274 "
+        "(marker anchored, CI gated)."
+    )
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="blocked then promoted", assignee="api")
+        kb.add_comment(conn, tid, author="api", body=pr_comment)
+        # Back-date the comment so the re-queue event below lands strictly
+        # AFTER it (the guard compares second granular timestamps).
+        _backdate_comments(conn, tid, seconds=300)
+        # A run that ended cleanly in dependency-wait (no crash).
+        now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'api', 'blocked', 'blocked', ?, ?)",
+                (tid, now - 600, now - 300),
+            )
+
+        # The fresh PR comment alone still guards (duplicate-PR protection).
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+        assert tid not in [s[0] for s in res.spawned]
+
+        # The dependency resolves -> the card is re-promoted AFTER the comment.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'promoted', NULL, ?)",
+                (tid, now - 100),
+            )
+        assert kbd.check_respawn_guard(conn, tid) is None
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+        assert tid not in dict(res.respawn_guarded)
+
+
+def test_active_pr_guard_holds_for_same_second_requeue_and_default_assignee(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail-closed corners of the re-queue bypass (t_9705e32e).
+
+    * A re-queue event timestamped in the SAME SECOND as the PR comment does
+      not count as "after" — the guard holds (strictly-after, fail closed).
+    * A ``kanban.default_assignee`` write records only an ``assigned`` event
+      with that source; it trips neither the handoff nor the re-queue
+      bypass — the dispatcher's own bookkeeping must not release a
+      duplicate-PR hold.
+    * With no re-queue event at all the fresh PR comment still defers.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config", lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    pr_comment = "Opened https://github.com/example/repo/pull/99 for review."
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="tie and default assignee", assignee="api")
+        now = int(__import__("time").time())
+        # Seed the PR comment at a fixed second (inside the 24h window).
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, 'api', ?, ?)",
+                (tid, pr_comment, now - 60),
+            )
+            pr_at = now - 60
+
+        # No re-queue event at all -> the PR comment still defers.
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        # Same-second tie: promoted exactly at the comment's second — guarded.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'promoted', NULL, ?)",
+                (tid, pr_at),
+            )
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        # kanban.default_assignee write (assigned event with that source)
+        # after the comment must not lift the guard either.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'assigned', ?, ?)",
+                (tid, json.dumps({"assignee": "api", "source": "kanban.default_assignee"}), pr_at + 5),
+            )
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        # One second later a genuine re-queue event lifts it (boundary check).
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'promoted', NULL, ?)",
+                (tid, pr_at + 1),
+            )
+        assert kbd.check_respawn_guard(conn, tid) is None

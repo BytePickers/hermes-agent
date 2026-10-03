@@ -1530,7 +1530,10 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    PR — or an explicit re-queue event (status change, dependency
+    re-promotion, unblock, reclaim) followed it strictly after: a deliberate
+    "run it now" intent, mirrored from the ``recent_success`` bypass). The
+    review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1633,6 +1636,26 @@ def check_respawn_guard(
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+            return None
+        # Re-queue bypass (t_9705e32e): an explicit re-queue-class event
+        # (status change, dependency re-promotion, unblock, reclaim) STRICTLY
+        # AFTER the newest PR comment is a deliberate "run it now" intent —
+        # the same bypass the ``recent_success`` rule grants. A run that ended
+        # cleanly in dependency-wait (outcome ``blocked``, no crash) leaves
+        # its plan-PR comment on the card; when its dependency resolves the
+        # card is re-promoted, and that re-queue — not the comment — is the
+        # current intent (the open plan PR is the planned vehicle). Same-second
+        # ties stay guarded (fail closed), and ``kanban.default_assignee``
+        # writes only record ``assigned`` events, so they can never trip this
+        # bypass.
+        requeued_after = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at > ? "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "LIMIT 1",
+            (task_id, int(c["created_at"] or 0)),
+        ).fetchone()
+        if requeued_after:
             return None
         return "active_pr"
 
