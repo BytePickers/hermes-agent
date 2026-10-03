@@ -427,6 +427,76 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         assert next_review is not None
 
 # ---------------------------------------------------------------------------
+# Unblock attribution: optional stated ground on status=ready
+# ---------------------------------------------------------------------------
+
+def _blocked_via_board(client, title):
+    """Create a task and push it to blocked through the board API."""
+    task = client.post("/api/plugins/kanban/tasks", json={"title": title}).json()["task"]
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "wait"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "blocked"
+    return task["id"]
+
+
+def _unblocked_events(task_id):
+    with kbc.connect() as conn:
+        return [e for e in kb.list_events(conn, task_id) if e.kind == "unblocked"]
+
+
+def test_patch_unblock_with_reason_records_ground(client):
+    tid = _blocked_via_board(client, "lift with ground")
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "ready", "reason": "operator confirmed the fix"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "ready"
+    events = _unblocked_events(tid)
+    assert events, "unblocked event missing"
+    assert events[-1].payload["reason"] == "operator confirmed the fix"
+
+
+def test_patch_unblock_without_reason_keeps_payload_shape(client):
+    tid = _blocked_via_board(client, "lift without ground")
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"})
+    assert r.status_code == 200, r.text
+    events = _unblocked_events(tid)
+    assert events, "unblocked event missing"
+    assert "reason" not in (events[-1].payload or {})
+
+
+def test_patch_unblock_blank_reason_treated_as_absent(client):
+    tid = _blocked_via_board(client, "lift with blank ground")
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "ready", "reason": "   "},
+    )
+    assert r.status_code == 200, r.text
+    events = _unblocked_events(tid)
+    assert events, "unblocked event missing"
+    assert "reason" not in (events[-1].payload or {})
+
+
+def test_bulk_unblock_with_reason_records_ground(client):
+    t1 = _blocked_via_board(client, "bulk lift 1")
+    t2 = _blocked_via_board(client, "bulk lift 2")
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t1, t2], "status": "ready", "reason": "maintenance window closed"},
+    )
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [entry["ok"] for entry in results] == [True, True]
+    for tid in (t1, t2):
+        events = _unblocked_events(tid)
+        assert events, f"unblocked event missing for {tid}"
+        assert events[-1].payload["reason"] == "maintenance window closed"
+
+# ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 

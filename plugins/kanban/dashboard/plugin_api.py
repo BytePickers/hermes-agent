@@ -526,6 +526,10 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    # Optional stated ground for a lift (blocked/scheduled -> ready via
+    # ``unblock_task``); recorded on the ``unblocked`` event payload when
+    # non-empty. Absent/blank lifts without a stated ground.
+    reason: Optional[str] = None
     # Handoff fields forwarded to complete_task on -> 'done' (parity with ``hermes kanban complete``).
     summary: Optional[str] = None
     metadata: Optional[dict] = None
@@ -542,6 +546,8 @@ class UpdateTaskBody(BaseModel):
 class BulkTaskBody(BaseModel):
     ids: list[str]
     status: Optional[str] = None
+    # Same lift ground as UpdateTaskBody.reason (recorded on the ``unblocked`` event).
+    reason: Optional[str] = None
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
     archive: bool = False
@@ -564,13 +570,14 @@ class _StatusRejected(Exception):
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
 
 
-def _drag_to(conn, task_id: str, s: str) -> bool:
-    """Drag-drop into ready/todo/triage: blocked/scheduled -> ready re-opens via ``unblock_task``;
-    leaving ``review`` goes through ``reopen_review_task`` (stale-run recovery, parent re-gate,
-    ``review_reopened`` event) instead of a raw write; ``triage`` needs no current-state query."""
+def _drag_to(conn, task_id: str, s: str, reason: Optional[str] = None) -> bool:
+    """Drag-drop into ready/todo/triage: blocked/scheduled -> ready re-opens via ``unblock_task``
+    (a stated ``reason`` rides onto the ``unblocked`` event); leaving ``review`` goes through
+    ``reopen_review_task`` (stale-run recovery, parent re-gate, ``review_reopened`` event) instead
+    of a raw write; ``triage`` needs no current-state query."""
     current = kanban_db.get_task(conn, task_id) if s != "triage" else None
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
-        return kanban_db.unblock_task(conn, task_id)
+        return kanban_db.unblock_task(conn, task_id, reason=reason)
     if current is not None and current.status == "review":
         return kanban_db.reopen_review_task(conn, task_id)
     return _set_status_direct(conn, task_id, s)
@@ -586,7 +593,7 @@ _STATUS_HANDLERS: dict[str, Any] = {
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
-    "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
+    "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready", reason=getattr(p, "reason", None)),
     "todo": lambda conn, tid, p: _drag_to(conn, tid, "todo"),
     "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage")}
 

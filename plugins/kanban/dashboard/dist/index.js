@@ -1604,12 +1604,20 @@
         return;
       }
       if (action.kind === "unblock") {
+        // Same optional stated-ground prompt as the drawer's Unblock
+        // action: cancel aborts, an empty answer lifts without one.
+        const raw = window.prompt(
+          tx(t, "unblockReason",
+            "Reason for unblocking (optional — cancel aborts, empty lifts without one):"),
+          "");
+        if (raw === null) return;
+        const stated = raw.trim();
         setBusy(true); setMsg(null);
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}`, boardSlug);
         SDK.fetchJSON(url, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status: "ready" }),
+          body: JSON.stringify(stated ? { status: "ready", reason: stated } : { status: "ready" }),
         }).then(function () {
           setMsg({ ok: true, text: tx(t, "unblockedMessage",
             "Unblocked {id}. Task is ready for the next tick.", { id: task.id }) });
@@ -3659,7 +3667,7 @@
       return applyPatch(patch);
 
       function applyPatch(patch) {
-        const finalPatch = withCompletionSummary(patch);
+        const finalPatch = withUnblockReason(withCompletionSummary(patch), opts);
         if (!finalPatch) return Promise.resolve();
         setPatchErr(null);
         return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug), {
@@ -3688,6 +3696,25 @@
         return null;
       }
       return Object.assign({}, patch, { result: summary, summary: summary });
+    }
+
+    // Local unblock-reason prompt, used only by the Unblock action
+    // (flagged with opts.unblockLift). Same documented window.prompt
+    // carve-out as withCompletionSummary above: cancel aborts the lift,
+    // an empty answer lifts without a stated ground, typed text rides
+    // onto the PATCH body as ``reason`` and lands on the ``unblocked``
+    // event payload.
+    function withUnblockReason(patch, opts) {
+      if (!patch || !opts || !opts.unblockLift || patch.status !== "ready") return patch;
+      const value = window.prompt(
+        tx(t, "unblockReason",
+          "Reason for unblocking (optional — cancel aborts, empty lifts without one):"),
+        "",
+      );
+      if (value === null) return null;
+      const reason = value.trim();
+      if (!reason) return patch;
+      return Object.assign({}, patch, { reason: reason });
     }
 
     // Triage specifier — calls the auxiliary LLM to flesh out a rough
@@ -4740,9 +4767,11 @@
     const [specifyMsg, setSpecifyMsg] = useState(null);
     const [decomposeBusy, setDecomposeBusy] = useState(false);
     const [decomposeMsg, setDecomposeMsg] = useState(null);
-    const b = function (label, patch, enabled, confirmMsg) {
+    const b = function (label, patch, enabled, confirmMsg, extraOpts) {
       return h(Button, {
-        onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
+        onClick: function () {
+          if (enabled !== false) props.onPatch(patch, Object.assign({ confirm: confirmMsg }, extraOpts));
+        },
         disabled: enabled === false,
         size: "sm",
       }, label);
@@ -4844,7 +4873,11 @@
         b(tx(t, "block", "Block"),     { status: "blocked" },
           task.status === "running" || task.status === "ready",
           getDestructiveConfirm(t, "blocked")),
-        b(tx(t, "unblock", "Unblock"),   { status: "ready" },    task.status === "blocked"),
+        // Unblock asks for an optional stated ground (opts.unblockLift →
+        // withUnblockReason in the drawer's doPatch); cancel aborts, an
+        // empty answer lifts without a stated reason.
+        b(tx(t, "unblock", "Unblock"),   { status: "ready" },    task.status === "blocked",
+          null, { unblockLift: true }),
         b(tx(t, "complete", "Complete"),  { status: "done" },
           task.status === "running" || task.status === "ready" || task.status === "blocked",
           getDestructiveConfirm(t, "done")),

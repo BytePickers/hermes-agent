@@ -3721,9 +3721,16 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    An optional ``reason`` is the stated ground for the lift (e.g. the
+    dashboard's unblock dialog). When given, it is recorded on the
+    ``unblocked`` event payload; without one the payload shape is unchanged.
+    """
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3754,14 +3761,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        ground = (reason or "").strip() or None
+        payload = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
         )
+        if ground:
+            payload = dict(payload or {})
+            payload["reason"] = ground
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 
