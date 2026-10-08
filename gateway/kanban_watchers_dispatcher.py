@@ -54,8 +54,10 @@ def _reconcile_dead_owner_claims(dispatcher: "_KanbanDispatcher") -> int:
         try:
             conn = _kbc().connect(board=slug)
             total += kb.reconcile_claims_of_dead_owners(conn)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- corrupt-DB quarantine deliberately reports one actionable line (same contract as tick_once); every other failure logs the traceback below
             if dispatcher.is_corrupt_board_db_error(exc):
+                # Deliberate one-line report, same contract as the tick quarantine:
+                # the actionable sentence is the message; a traceback adds nothing.
                 dispatcher.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
                 logger.error(
                     "kanban dispatcher: board %s database %s is not a valid "
@@ -66,9 +68,7 @@ def _reconcile_dead_owner_claims(dispatcher: "_KanbanDispatcher") -> int:
                     slug, fingerprint[0],
                 )
             else:
-                logger.warning(
-                    "kanban dispatcher: startup reconcile failed on board %s: %s", slug, exc,
-                )
+                logger.exception("kanban dispatcher: startup reconcile failed on board %s", slug)
         finally:
             if conn is not None:
                 with contextlib.suppress(Exception):
