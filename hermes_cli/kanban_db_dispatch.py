@@ -25,6 +25,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli import kanban_pr_state as _pr_state
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -85,6 +86,29 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
+)
+
+# Re-queue event kinds that release the ``active_pr`` hold when they arrive
+# STRICTLY AFTER the newest PR-URL comment (content of upstream PRs #162/#163,
+# t_ebaaee1c): a deliberate "run it again" order — status flip, promotion,
+# unblock, reclaim — re-arms the card for a fresh run the way a handoff does.
+# The dispatcher's default_assignee write only ever emits ``assigned`` events,
+# so it can never ride this path (payload guard in _is_handoff_event).
+_RESPAWN_GUARD_REQUEUE_KINDS = frozenset(
+    {"status", "promoted", "unblocked", "reclaimed"}
+)
+
+# Single source of truth for the section-4 event query: the handoff kinds
+# (payload-validated by _is_handoff_event) plus the re-queue kinds above, so
+# the SQL list and the Python-side release check cannot drift apart.
+_RESPAWN_GUARD_RELEASE_KIND_SQL = ", ".join(
+    f"'{kind}'"
+    for kind in (
+        "assigned",
+        "changes_requested",
+        "review_reopened",
+        *_RESPAWN_GUARD_REQUEUE_KINDS,
+    )
 )
 
 
@@ -1688,11 +1712,15 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    (PR URL in a recent comment; re-spawning risks a duplicate PR — released
+    when a handoff or explicit re-queue event followed the newest PR comment:
+    the named profile must work on that PR, or the card was deliberately
+    re-queued (#111910, #162/#163, t_ebaaee1c); or when EVERY PR linked in the
+    window is already merged/closed, probed fail-closed via
+    :mod:`hermes_cli.kanban_pr_state` on the hold path only — without network
+    proof the hold stands). The review lane skips the last two: they are the
+    *inputs* to a review handoff. Stale / dead claim locks are NOT a guard
+    reason — the reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1771,12 +1799,22 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    #    Release when EITHER:
+    #    (a) a handoff or explicit re-queue event arrives STRICTLY AFTER the
+    #        newest PR comment (operator reassign, reviewer changes_requested,
+    #        review reopen, or a deliberate re-queue: status/promoted/unblocked/
+    #        reclaimed) — a closer, an implementer finishing the PR, or a
+    #        "run it again" order, not a duplicate implementation (#111910;
+    #        re-queue release = #162/#163, t_ebaaee1c). A same-second tie
+    #        stays guarded (fail closed).
+    #    (b) EVERY PR linked in the window (across all comments, deduped) is
+    #        already merged/closed — nothing open is left to duplicate
+    #        (t_ebaaee1c R2). Probed via kanban_pr_state on THIS hold path
+    #        only (cards without PR comments never pay a probe), cached per
+    #        URL; any open or unknown PR keeps the hold (fail closed, R3).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    linked_prs: list[tuple[str, str, int]] = []
+    anchored = False
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
@@ -1785,18 +1823,34 @@ def check_respawn_guard(
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
+        linked_prs.extend(_pr_state.parse_pr_urls(body))
+        if anchored:
+            # Older comments only contribute URLs: the event anchor stays the
+            # newest PR comment (an event between two PR comments must not
+            # release a card that was re-commented afterwards).
+            continue
+        anchored = True
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+            # Kind list mirrors the handoff kinds plus
+            # _RESPAWN_GUARD_REQUEUE_KINDS (built once in the constants block).
+            f"SELECT kind, payload FROM task_events "
+            f"WHERE task_id = ? AND created_at > ? "
+            f"AND kind IN ({_RESPAWN_GUARD_RELEASE_KIND_SQL})",
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
-        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+        if any(
+            e["kind"] in _RESPAWN_GUARD_REQUEUE_KINDS
+            or _is_handoff_event(e["kind"], e["payload"])
+            for e in events
+        ):
             return None
-        return "active_pr"
-
-    return None
+    if not anchored:
+        return None
+    # Hold path: state release — every linked PR provably terminal.
+    if _pr_state.all_prs_terminal(linked_prs):
+        return None
+    return "active_pr"
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
