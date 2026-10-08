@@ -46,6 +46,29 @@ def _board_slugs(kb: Any) -> list:
     return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
 
 
+async def reconcile_dead_owner_claims_at_boot(dispatcher) -> None:
+    """One-shot startup reconcile before the dispatcher's first tick.
+
+    Running claims whose owner process (a previous gateway/dispatcher PID)
+    died uncleanly are booked back to their source phase now — instead of
+    aging into claim-TTL reclaims booked as failures, which inflated the
+    capacity count and tripped the failure breaker after a rollover. A
+    failure here is logged and swallowed: boot bookkeeping must never keep
+    the dispatcher from starting.
+    """
+    from gateway.kanban_watchers_dispatcher import _reconcile_dead_owner_claims
+
+    try:
+        reconciled = await _to_thread_process_service(_reconcile_dead_owner_claims, dispatcher)
+        if reconciled:
+            logger.info(
+                "kanban dispatcher: startup reconcile requeued %d claim(s) of dead owners",
+                reconciled,
+            )
+    except Exception:
+        logger.exception("kanban dispatcher: startup reconcile failed")
+
+
 def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
     """Parse an optional ``kanban.<key>`` int cap; None when unset or invalid (< 1 is invalid)."""
     raw = kanban_cfg.get(key)

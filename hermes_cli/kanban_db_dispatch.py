@@ -1507,21 +1507,6 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
     return True
 
 
-def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
-    """Reset the unified consecutive-failures counter.
-
-    Called from ``complete_task`` on success. NOT called on spawn success: a
-    spawn proves the worker could start, not that the run will succeed, so
-    timeouts and crashes must accumulate across spawn boundaries.
-    """
-    with _kb.write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL WHERE id = ?",
-            (task_id,),
-        )
-
-
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -3009,6 +2994,14 @@ def run_daemon(
                 with contextlib.suppress(ValueError, OSError):
                     signal.signal(sig, _handle)
 
+    # Startup reconcile + shutdown drain are one-shot bookkeeping at the daemon's
+    # process boundaries (hermes_cli/kanban_db_drain.py): dead-owner claims are
+    # booked back before the first tick; this daemon's own claims are drained
+    # after the loop. Best-effort — a failure never kills the daemon.
+    from hermes_cli import kanban_db_drain as _drain
+
+    _drain.reconcile_at_daemon_boot()
+
     while not stop_event.is_set():
         try:
             # Re-resolved every tick (config load is mtime-cached) so operator
@@ -3029,6 +3022,8 @@ def run_daemon(
             import traceback
             traceback.print_exc()
         stop_event.wait(timeout=interval)
+
+    _drain.drain_at_daemon_exit()
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

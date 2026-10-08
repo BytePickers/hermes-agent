@@ -27,6 +27,54 @@ def _kbd():
     from hermes_cli import kanban_db_dispatch
     return kanban_db_dispatch
 
+
+def _reconcile_dead_owner_claims(dispatcher: "_KanbanDispatcher") -> int:
+    """One-shot startup reconcile across every board the dispatcher serves.
+
+    Running claims whose owner process (a previous gateway/dispatcher PID)
+    died uncleanly are booked back to their source phase before the first
+    tick — instead of aging into claim-TTL reclaims booked as failures,
+    which inflated the capacity count and tripped the failure breaker after
+    a rollover. Per-board connection (same shape as ``tick_once``); one
+    board's failure never skips the others. Runs only when this gateway
+    holds the dispatcher singleton lock — the lock holder reconciles.
+
+    Corrupt board DBs follow the exact tick contract: quarantined here with
+    the same one-line actionable error (no traceback) so the first tick
+    skips them instead of re-failing, and the board stays paused until the
+    file changes or the quarantine timer lifts.
+    """
+    kb = dispatcher.kb
+    total = 0
+    for slug in dispatcher._board_slugs():
+        fingerprint = dispatcher.board_db_fingerprint(slug)
+        if not dispatcher._quarantine_lifted(slug, fingerprint):
+            continue
+        conn = None
+        try:
+            conn = _kbc().connect(board=slug)
+            total += kb.reconcile_claims_of_dead_owners(conn)
+        except Exception as exc:
+            if dispatcher.is_corrupt_board_db_error(exc):
+                dispatcher.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+                logger.error(
+                    "kanban dispatcher: board %s database %s is not a valid "
+                    "SQLite database; pausing dispatch for this board until "
+                    "the file changes, the gateway restarts, or the "
+                    "quarantine timer expires. Move or restore the file, "
+                    "then run `hermes kanban init` if you need a fresh board.",
+                    slug, fingerprint[0],
+                )
+            else:
+                logger.warning(
+                    "kanban dispatcher: startup reconcile failed on board %s: %s", slug, exc,
+                )
+        finally:
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
+    return total
+
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
 

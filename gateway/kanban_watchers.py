@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from gateway.kanban_watchers_common import (
+    reconcile_dead_owner_claims_at_boot,
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,
     _release_singleton_lock,
@@ -282,6 +283,14 @@ class GatewayKanbanWatchersMixin:
         dispatcher = _KanbanDispatcher(_kb, settings)
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
+
+        # Startup reconcile (one-shot, before the first tick): claims whose
+        # owner process died uncleanly are booked back now, not aged into
+        # TTL reclaims booked as failures. Only the lock holder reconciles —
+        # when the singleton lock is contended, the holder does it.
+        if self._owns_kanban_dispatcher_lock():
+            await reconcile_dead_owner_claims_at_boot(dispatcher)
+
         while self._running:
             try:
                 # Reap zombies before per-board work so a board DB failure

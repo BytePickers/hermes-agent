@@ -27,9 +27,10 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli.kanban_db_drain import _clear_failure_counter, drain_claims_on_shutdown, reconcile_claims_of_dead_owners
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -4439,7 +4440,6 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
-    _clear_failure_counter,
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,

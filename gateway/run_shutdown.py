@@ -28,43 +28,13 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
+from gateway.run_shutdown_kanban_drain import GatewayKanbanDrainMixin
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
-
-def _exit_with_failure_verdict(runner) -> bool:
-    """True (after logging the reason) when the runner asked for a failure exit."""
-    if not runner.should_exit_with_failure:
-        return False
-    if runner.exit_reason:
-        logger.error("Gateway exiting with failure: %s", runner.exit_reason)
-    return True
-
-
-def _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown: bool) -> bool:
-    """Resolve the process verdict after either startup abort or normal shutdown."""
-    if _exit_with_failure_verdict(runner):
-        return False
-    if runner.exit_code is not None:
-        raise SystemExit(runner.exit_code)
-    if signal_initiated_shutdown and not runner._restart_requested:
-        logger.info(
-            "Exiting with code 1 (signal-initiated shutdown without restart "
-            "request) so the service manager can revive the gateway."
-        )
-        return False
-    # Older restart paths may not set ``runner.exit_code``; retain the service-restart fallback.
-    if runner._restart_via_service:
-        logger.info(
-            "Exiting with code %d (service-restart requested) so the service "
-            "manager relaunches the gateway.",
-            GATEWAY_SERVICE_RESTART_EXIT_CODE,
-        )
-        raise SystemExit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
-    return True
 
 # Windows has no bash/setsid chain: a tiny detached Python watcher waits for the gateway PID to
 # exit (bounded), then spawns ``hermes gateway restart``.
@@ -169,7 +139,7 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
-class GatewayShutdownMixin(GatewaySessionEndMixin):
+class GatewayShutdownMixin(GatewayKanbanDrainMixin, GatewaySessionEndMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -2234,6 +2204,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
             await GatewayRunner._stop_finalize_agents_and_adapters(self, ctx)
+            await GatewayRunner._stop_drain_kanban_claims(self, ctx)
             await GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
