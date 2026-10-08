@@ -111,6 +111,12 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    reaped_orphan_runs: list[int] = field(default_factory=list)
+    """Run ids closed as ``failed/reaped_orphan`` by :func:`reap_orphaned_runs`
+    (ghost rows: the card left ``running`` before its run row ended)."""
+    released_orphan_claims: list[str] = field(default_factory=list)
+    """Task ids whose stale claim pointer (run already over, card not running)
+    was cleared by :func:`release_orphaned_task_claims`."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -906,6 +912,185 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
         )
     return reconciled
+
+
+# Ghost-run harvest hysteresis: a run whose card left 'running' is closed only
+# after this absolute minimum age, so a card transition racing a fresh spawn
+# (claim, park, complete within minutes) never trips the sweep (planer ruling:
+# status 'running' AND dead heartbeat AND absolute minimum age).
+GHOST_RUN_MIN_AGE_SECONDS = 15 * 60
+
+
+def reap_orphaned_runs(conn: sqlite3.Connection) -> list[int]:
+    """Close ``running`` task_runs whose card has left ``running`` (ghost rows).
+
+    Every existing sweep keys on ``tasks.status = 'running'``; a card that
+    moves on (parked, completed, re-claimed elsewhere) before its run row ends
+    leaves that row ``running`` forever — heartbeat updates are bound to the
+    running card, so nothing ever closes it (t_56037ffe: rows 8819/9213/9621/
+    10087 ran 2.2-6.8 days and inflated every running-count, shrinking real
+    spawn capacity). A ghost run IS a failed run: it is closed per row (own
+    write txn, CAS on ``status='running' AND ended_at IS NULL``) as
+    ``failed/reaped_orphan`` with the origin in ``metadata`` — no new terminal
+    state vocabulary — plus a visible ``ghost_run_reaped`` event on the card;
+    nothing is deleted silently. A stale claim pointer on the departed card is
+    cleared in the same transaction, else the card stays unspawnable although
+    its run is over (run 10814: card blocked 65 min after the dispatcher had
+    already reaped the row). Live host-local workers are never touched: this is
+    pure bookkeeping, no signals — a slow-but-alive worker survives, its row is
+    retried next tick. ``done``/``archived`` cards keep their claim fields
+    (forensics contract of ``_end_run``; they never spawn).
+
+    Returns the reaped run ids.
+    """
+    now = int(time.time())
+    reaped: list[int] = []
+    host_prefix = _kb._host_prefix()
+    rows = conn.execute(
+        "SELECT r.id, r.task_id, r.started_at, r.last_heartbeat_at, "
+        "       r.worker_pid, r.worker_started_at, r.claim_lock, "
+        "       t.status AS task_status, t.current_run_id AS card_run_id "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.status = 'running' AND r.ended_at IS NULL "
+        "  AND (t.status != 'running' "
+        "       OR (t.current_run_id IS NOT NULL AND t.current_run_id != r.id)) "
+        "  AND (r.last_heartbeat_at IS NULL "
+        "       OR ? - r.last_heartbeat_at > ?) "
+        "  AND r.started_at <= ? - ?",
+        (now, _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS, now, GHOST_RUN_MIN_AGE_SECONDS),
+    ).fetchall()
+    for row in rows:
+        pid = row["worker_pid"]
+        if (pid
+                and str(row["claim_lock"] or "").startswith(host_prefix)
+                and _worker_alive(pid, row["worker_started_at"])):
+            # Live host-local worker beside a departed card: leave it alone,
+            # its row closes once the worker finishes (or a sweep kills it).
+            continue
+        tid = row["task_id"]
+        run_id = row["id"]
+        try:
+            with _kb.write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE task_runs SET status = 'failed', outcome = 'reaped_orphan', "
+                    "ended_at = ?, error = ?, metadata = ? "
+                    "WHERE id = ? AND status = 'running' AND ended_at IS NULL",
+                    (now, "ghost run: card left 'running' before the run ended", None, run_id),
+                )
+                if cur.rowcount != 1:
+                    continue  # lost the race — next tick re-checks
+                # Coupled claim release: only when the card still points at
+                # THIS run and has left the spawning states for good.
+                claim_released = False
+                if (row["card_run_id"] == run_id
+                        and row["task_status"] not in ("running", "done", "archived")):
+                    claim_released = conn.execute(
+                        "UPDATE tasks SET current_run_id = NULL, claim_lock = NULL, "
+                        "claim_expires = NULL "
+                        "WHERE id = ? AND current_run_id = ? "
+                        "  AND status NOT IN ('running', 'done', 'archived')",
+                        (tid, run_id),
+                    ).rowcount == 1
+                metadata = {
+                    "reap_reason": "ghost_run_card_departed",
+                    "reap_at": now,
+                    "reap_by": "dispatcher",
+                    "run_age_seconds": now - int(row["started_at"]),
+                    "heartbeat_age_seconds": (
+                        now - int(row["last_heartbeat_at"])
+                        if row["last_heartbeat_at"] is not None else None
+                    ),
+                    "task_status": row["task_status"],
+                    "card_run_id": row["card_run_id"],
+                    "claim_released": claim_released,
+                }
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (_kb._json_or_null(metadata), run_id),
+                )
+                _kb._append_event(
+                    conn, tid, "ghost_run_reaped",
+                    {"run_id": run_id, **metadata}, run_id=run_id,
+                )
+            reaped.append(run_id)
+            _kb._log.info(
+                "kanban dispatch: reaped ghost run %s of task %s "
+                "(card status %r, age %ss, claim released: %s)",
+                run_id, tid, row["task_status"], metadata["run_age_seconds"], claim_released,
+            )
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: ghost run reap failed for run %s (task %s)",
+                run_id, tid, exc_info=True,
+            )
+    return reaped
+
+
+def release_orphaned_task_claims(conn: sqlite3.Connection) -> list[str]:
+    """Clear stale claim pointers on cards whose run is already over.
+
+    The run row was reaped/ended by a path that never touched the card's CAS
+    (the card is no longer ``running``), but the card kept ``current_run_id`` +
+    an expired ``claim_lock``/``claim_expires`` — and ``_lane_rows`` requires
+    ``claim_lock IS NULL``, so the card was unspawnable although nothing ran
+    (run 10814: blocked 65 min past its run's end). Candidates: not
+    ``running``/``done``/``archived`` (spawn-blocking lanes), expired claim,
+    and either no run pointer or a pointer at an ended/missing run — a pointer
+    at a still-live run belongs to :func:`reap_orphaned_runs`'s coupled
+    release in the same tick. Pure bookkeeping: no status change, no failure
+    counters; the before-values go into a visible ``orphaned_claim_released``
+    event, nothing is deleted silently. ``done``/``archived`` cards keep their
+    fields (forensics contract; they never spawn).
+
+    Returns the released task ids.
+    """
+    now = int(time.time())
+    released: list[str] = []
+    rows = conn.execute(
+        "SELECT t.id, t.status, t.current_run_id, t.claim_lock, t.claim_expires "
+        "FROM tasks t "
+        "WHERE t.status NOT IN ('running', 'done', 'archived') "
+        "  AND t.claim_lock IS NOT NULL AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ? "
+        "  AND (t.current_run_id IS NULL OR NOT EXISTS ("
+        "        SELECT 1 FROM task_runs r "
+        "        WHERE r.id = t.current_run_id "
+        "          AND r.status = 'running' AND r.ended_at IS NULL))",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        before = {
+            "reason": "orphaned_claim",
+            "task_status": row["status"],
+            "current_run_id": row["current_run_id"],
+            "claim_lock": row["claim_lock"],
+            "claim_expires": _kb._opt_int(row["claim_expires"]),
+            "now": now,
+        }
+        try:
+            with _kb.write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET current_run_id = NULL, claim_lock = NULL, "
+                    "claim_expires = NULL "
+                    "WHERE id = ? AND claim_lock IS ? AND claim_expires IS ?",
+                    (tid, row["claim_lock"], row["claim_expires"]),
+                )
+                if cur.rowcount != 1:
+                    continue  # lost the race — next tick re-checks
+                _kb._append_event(conn, tid, "orphaned_claim_released", before)
+            released.append(tid)
+            _kb._log.info(
+                "kanban dispatch: released orphaned claim on task %s "
+                "(status %r, run %s over, expired %s)",
+                tid, row["status"], row["current_run_id"], row["claim_expires"],
+            )
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: orphaned claim release failed for task %s",
+                tid, exc_info=True,
+            )
+    return released
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -1894,6 +2079,60 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _live_running_rows(conn: sqlite3.Connection) -> list:
+    """``running`` cards with a live process behind them — the cap basis.
+
+    A row counts when its claim is fresh OR a live host-local worker backs it:
+    a worker that outlived its TTL must still hold its slot, else the cap would
+    spawn a duplicate beside it (t_61a60c56). Ghost rows — expired claim, dead
+    or absent worker — are excluded; the reclaim phase closes them earlier in
+    the same tick, this filter is the hard backstop (t_56037ffe: four ghost
+    rows held the board at 12-14 "running" against a cap of 8).
+    """
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT id, assignee, claim_expires, worker_pid, worker_started_at, claim_lock "
+        "FROM tasks WHERE status = 'running'"
+    ).fetchall()
+    host_prefix = _kb._host_prefix()
+    live = []
+    for row in rows:
+        expires = row["claim_expires"]
+        if expires is None or int(expires) >= now:
+            live.append(row)
+            continue
+        pid = row["worker_pid"]
+        if (pid
+                and str(row["claim_lock"] or "").startswith(host_prefix)
+                and _worker_alive(pid, row["worker_started_at"])):
+            live.append(row)
+    return live
+
+
+def count_live_running_tasks(conn: sqlite3.Connection) -> int:
+    """Number of ``running`` cards with a live process behind them.
+
+    Spawn-budget counterpart of :func:`count_running_tasks` (which stays for
+    the multi-board sweep): ghost rows — expired claim, dead/absent worker —
+    must not shrink the real spawn capacity.
+    """
+    return len(_live_running_rows(conn))
+
+
+def count_live_running_per_profile(conn: sqlite3.Connection) -> dict[str, int]:
+    """Per-assignee live running counts (successor of the raw profile SQL).
+
+    Same liveness predicate as :func:`count_live_running_tasks`: a ghost row on
+    an assignee's name otherwise presses that profile's cap (#21582).
+    """
+    counts: dict[str, int] = {}
+    for row in _live_running_rows(conn):
+        assignee = row["assignee"]
+        if assignee is not None:
+            counts[assignee] = counts.get(assignee, 0) + 1
+    return counts
+
+
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
@@ -2202,6 +2441,13 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    # Ghost-run harvest (t_56037ffe): run rows whose card left 'running' are
+    # invisible to every sweep above (they all key on tasks.status='running') —
+    # close them and release the card-side claim remnants BEFORE the budget is
+    # counted and promotion re-opens lanes, so the same tick that reaps also
+    # unblocks the card.
+    result.reaped_orphan_runs = reap_orphaned_runs(conn)
+    result.released_orphan_claims = release_orphaned_task_claims(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2224,10 +2470,13 @@ def _tick_spawn_budget(
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
     # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
+    # Live count (t_56037ffe): ghost rows (expired claim, dead/absent worker)
+    # must not shrink the real budget; the reclaim phase closes them first,
+    # this liveness filter is the backstop.
     running_count = 0
     spawn_budget: Optional[int] = None
     if max_spawn is not None or max_in_progress is not None:
-        running_count = count_running_tasks(conn)
+        running_count = count_live_running_tasks(conn)
 
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
@@ -2374,12 +2623,9 @@ def _dispatch_once_locked(
     ) else None
     per_profile_running: dict[str, int] = {}
     if per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+        # Live counts (t_56037ffe): same liveness predicate as the spawn
+        # budget — a ghost row on an assignee's name must not press their cap.
+        per_profile_running = count_live_running_per_profile(conn)
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
