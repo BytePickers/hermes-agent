@@ -285,8 +285,11 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     let stream: MediaStream
 
     try {
+      // Browser noiseSuppression gate-chops speech (fragments,
+      // shifted speech onset reaching the STT recognizer) - keep it off.
+      // autoGainControl stabilizes the level; echoCancellation stays on.
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true }
+        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true }
       })
     } catch (error) {
       throw micError(error, copy)

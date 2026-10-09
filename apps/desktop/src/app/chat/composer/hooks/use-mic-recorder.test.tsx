@@ -188,3 +188,31 @@ describe('useMicRecorder level meter', () => {
     expect(recording).toMatchObject({ meterFailed: false })
   })
 })
+
+describe('useMicRecorder speech-preserving constraints', () => {
+  it('requests speech-preserving audio constraints', async () => {
+    const getUserMedia = vi.fn(
+      async (_constraints: { audio: Record<string, boolean> }) => ({ getTracks: () => [{ stop: vi.fn() }] })
+    )
+
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia }
+    })
+
+    const { result } = renderHook(() => useMicRecorder(copy))
+
+    await act(async () => {
+      await result.current.handle.start()
+    })
+
+    const audio = getUserMedia.mock.calls[0]?.[0]?.audio
+
+    expect(audio).toEqual({
+      echoCancellation: true,
+      noiseSuppression: false,
+      autoGainControl: true
+    })
+    expect(result.current.recording).toBe(true)
+  })
+})
