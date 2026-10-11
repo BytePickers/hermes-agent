@@ -75,7 +75,16 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    # A list row must stay single-line: a raw line break inside a title renders
+    # a headless continuation line (no card id/status prefix) that downstream
+    # parsers can mistake for an orphaned card (t_9d78bc43). Flatten each break
+    # variant to one space; `show`, `--json` and the stored title keep the
+    # original text.
+    title = (
+        t.title.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        if t.title else t.title
+    )
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {title}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
