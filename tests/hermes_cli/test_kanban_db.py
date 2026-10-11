@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -2008,3 +2009,819 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+# ---------------------------------------------------------------------------
+# Claim-release survivor guard: release only after verified death of the
+# worker AND — where knowable — its whole process group. Covers the operator
+# reclaim, the max-runtime terminator, the done-reopen invalidation, the
+# dashboard direct status write and the guarded non-running claim sweep.
+# ---------------------------------------------------------------------------
+
+
+def test_worker_survived_termination_group_alive_counts_as_survived():
+    """A confirmably-alive group counts as survived even when the leader is
+    reported dead: ``group_verified_dead is False`` must HOLD the claim instead
+    of releasing it (a D-state tool child SIGKILL cannot reap yet). ``None``
+    (unknowable platform) keeps the leader-only contract; the live-line
+    identity refusal (``signal_refused``) still counts as survival."""
+    base = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": False,
+    }
+    assert kbd._worker_survived_termination(base) is True
+    assert kbd._worker_survived_termination(
+        {**base, "group_verified_dead": None}
+    ) is False
+    assert kbd._worker_survived_termination(
+        {**base, "group_verified_dead": True}
+    ) is False
+    # Leader still alive: unchanged survival semantics.
+    assert kbd._worker_survived_termination(
+        {**base, "terminated": False, "group_verified_dead": None}
+    ) is True
+    # Not our worker / no-op attempt: never blocks the release path.
+    assert kbd._worker_survived_termination(
+        {**base, "termination_attempted": False}
+    ) is False
+    assert kbd._worker_survived_termination(
+        {**base, "host_local": False}
+    ) is False
+    assert kbd._worker_survived_termination(
+        {
+            "termination_attempted": False,
+            "signal_refused": True,
+            "host_local": True,
+            "terminated": False,
+        }
+    ) is True
+
+
+def test_reclaim_task_defers_when_worker_survives(kanban_home, monkeypatch):
+    """Operator reclaim must not release the claim while the worker (or its
+    group) survived: the running task keeps its claim, a visible
+    ``reclaim_deferred`` event is written, and the call returns False. A later
+    call with a verified-dead result releases normally."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="reclaim-defer", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.status == "running"
+        kbd._set_worker_pid(conn, tid, 424242)
+        prev_lock = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["claim_lock"]
+
+    survivor = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": False,
+    }
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker", lambda *a, **k: dict(survivor)
+    )
+    with kbc.connect() as conn:
+        assert kb.reclaim_task(conn, tid, reason="ops") is False
+        row = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] == prev_lock
+        deferred = [
+            e for e in kb.list_events(conn, tid) if e.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload.get("reason") == "manual_reclaim_worker_alive"
+        assert deferred[0].payload.get("group_verified_dead") is False
+
+    dead = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": True,
+    }
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker", lambda *a, **k: dict(dead)
+    )
+    with kbc.connect() as conn:
+        assert kb.reclaim_task(conn, tid, reason="ops") is True
+        row = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["status"] != "running"
+        assert row["claim_lock"] is None
+
+
+def test_reclaim_task_leaves_non_running_claim_for_guarded_sweep(
+    kanban_home, monkeypatch,
+):
+    """A non-running claim holder survives the termination attempt: reclaim_task
+    returns False WITHOUT releasing (the guarded non-running sweep owns that
+    termination path) and writes no defer event (the claim is not on a
+    running row)."""
+    survivor = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": False,
+    }
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker", lambda *a, **k: dict(survivor)
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="ready-defer", assignee="worker")
+        kb.claim_task(conn, tid)
+        prev_lock = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["claim_lock"]
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.reclaim_task(conn, tid, reason="ops") is False
+        row = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] == prev_lock
+        assert not [
+            e for e in kb.list_events(conn, tid) if e.kind == "reclaim_deferred"
+        ]
+
+
+def _spawn_leader_with_tool_child(child_pid_file: Path) -> subprocess.Popen:
+    """Spawn a stand-in worker: a leader (like the dispatcher's worker, spawned
+    with ``start_new_session=True``) holding one in-flight tool child (a
+    ``sleep`` standing in for a bash probe). The child's pid is written to
+    ``child_pid_file`` so the test can assert on its death."""
+    return subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import subprocess, time\n"
+            f"open({str(child_pid_file)!r}, 'w').write("
+            "str(subprocess.Popen(['sleep', '60']).pid))\n"
+            "time.sleep(300)\n",
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _read_child_pid(child_pid_file: Path) -> int:
+    deadline = time.time() + 10
+    while not child_pid_file.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    return int(child_pid_file.read_text().strip())
+
+
+def _cleanup_group(leader: subprocess.Popen) -> None:
+    try:
+        os.killpg(leader.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        leader.wait(timeout=10)
+    except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+        pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_terminate_reclaimed_worker_kills_surviving_tool_children(tmp_path):
+    """Regression: reclaim termination must cover the process group.
+
+    Dispatcher workers are spawned with ``start_new_session=True``, so the
+    worker pid IS the process-group leader and in-flight tool children live in
+    the same group. A pid-only SIGTERM orphans them: the leader dies,
+    ``terminated=True`` is reported, and the orphan keeps writing on the task
+    beside the re-spawned worker (zombie-run / double-writer risk)."""
+    leader = _spawn_leader_with_tool_child(tmp_path / "child_pid")
+    try:
+        child_pid = _read_child_pid(tmp_path / "child_pid")
+
+        info = kbd._terminate_reclaimed_worker(
+            leader.pid, kb._claimer_id(), signal_fn=None,
+        )
+
+        # Leader is gone (unchanged behaviour)...
+        assert info["termination_attempted"] is True
+        assert info["terminated"] is True
+        # ...and the regression: the in-flight tool child died WITH it.
+        assert not kbd._pid_alive(child_pid), (
+            "tool child survived reclaim termination (pid-only kill)"
+        )
+        assert info.get("group_verified_dead") is True
+        assert info.get("signal_mode") == "group"
+    finally:
+        _cleanup_group(leader)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_reclaim_task_defers_then_releases_real_processes(kanban_home, tmp_path):
+    """Liveness proof with real processes: leader + tool child survive a no-op
+    signal, so reclaim_task holds the claim (defer event) instead of releasing
+    it; with real signalling the whole group dies, the group is verified dead,
+    and the claim is released."""
+    leader = _spawn_leader_with_tool_child(tmp_path / "child_pid")
+    try:
+        child_pid = _read_child_pid(tmp_path / "child_pid")
+        with kbc.connect() as conn:
+            tid = kb.create_task(conn, title="reclaim-real", assignee="worker")
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None and claimed.status == "running"
+            kbd._set_worker_pid(conn, tid, leader.pid)
+
+            def _noop_signal(pid, sig):
+                return None
+
+            assert kb.reclaim_task(
+                conn, tid, reason="ops", signal_fn=_noop_signal,
+            ) is False
+            row = conn.execute(
+                "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            assert row["status"] == "running"
+            assert row["claim_lock"] is not None
+            assert kbd._pid_alive(child_pid), (
+                "tool child must survive the no-op signal for this probe"
+            )
+            assert any(
+                e.kind == "reclaim_deferred"
+                and e.payload.get("reason") == "manual_reclaim_worker_alive"
+                for e in kb.list_events(conn, tid)
+            ), "survivor must leave a visible reclaim_deferred event"
+
+        assert kbd._pid_alive(child_pid)
+        with kbc.connect() as conn:
+            assert kb.reclaim_task(conn, tid, reason="ops") is True
+            row = conn.execute(
+                "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            assert row["status"] != "running"
+            assert row["claim_lock"] is None
+        assert not kbd._pid_alive(child_pid), (
+            "tool child survived the real group termination"
+        )
+    finally:
+        _cleanup_group(leader)
+
+
+def test_enforce_max_runtime_defers_when_worker_survives(
+    kanban_home, monkeypatch,
+):
+    """The max-runtime terminator must not release the claim while the worker
+    (or a confirmably alive group member) survived the kill: the task stays
+    ``running`` with its claim, a visible ``reclaim_deferred`` event is
+    written, and no ``timed_out`` completion (run end, event, failure counter)
+    happens. With a verified-dead result the release behaves exactly as
+    before."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="max-runtime-defer", assignee="worker",
+            max_runtime_seconds=60,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.status == "running"
+        kbd._set_worker_pid(conn, tid, 424242)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (int(time.time()) - 120, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = "
+                "(SELECT current_run_id FROM tasks WHERE id = ?)",
+                (int(time.time()) - 120, tid),
+            )
+        prev_lock = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["claim_lock"]
+
+    survivor = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": False,
+    }
+    monkeypatch.setattr(
+        kbd, "_terminate_reclaimed_worker", lambda *a, **k: dict(survivor)
+    )
+    with kbc.connect() as conn:
+        assert kbd.enforce_max_runtime(conn) == []
+        row = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] == prev_lock
+        deferred = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload.get("reason") == "max_runtime_worker_alive"
+        assert deferred[0].payload.get("group_verified_dead") is False
+        assert not [
+            e for e in kb.list_events(conn, tid) if e.kind == "timed_out"
+        ]
+
+    dead = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": True,
+    }
+    monkeypatch.setattr(
+        kbd, "_terminate_reclaimed_worker", lambda *a, **k: dict(dead)
+    )
+    with kbc.connect() as conn:
+        assert kbd.enforce_max_runtime(conn) == [tid]
+        row = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["status"] != "running"
+        assert row["claim_lock"] is None
+        assert [
+            e for e in kb.list_events(conn, tid) if e.kind == "timed_out"
+        ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_enforce_max_runtime_defers_then_releases_real_processes(
+    kanban_home, tmp_path,
+):
+    """Liveness proof with real processes: a max-runtime termination that
+    cannot verify death (no-op signal; leader + tool child alive) HOLDS the
+    claim beside the living group; with real signalling the whole group is
+    verified dead and the claim is released as before."""
+    leader = _spawn_leader_with_tool_child(tmp_path / "child_pid")
+    try:
+        child_pid = _read_child_pid(tmp_path / "child_pid")
+        with kbc.connect() as conn:
+            tid = kb.create_task(
+                conn, title="max-runtime-real", assignee="worker",
+                max_runtime_seconds=60,
+            )
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None and claimed.status == "running"
+            kbd._set_worker_pid(conn, tid, leader.pid)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET started_at = ? WHERE id = ?",
+                    (int(time.time()) - 120, tid),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET started_at = ? WHERE id = "
+                    "(SELECT current_run_id FROM tasks WHERE id = ?)",
+                    (int(time.time()) - 120, tid),
+                )
+
+            def _noop_signal(pid, sig):
+                return None
+
+            assert kbd.enforce_max_runtime(
+                conn, signal_fn=_noop_signal,
+            ) == []
+            row = conn.execute(
+                "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            assert row["status"] == "running"
+            assert row["claim_lock"] is not None
+            assert kbd._pid_alive(child_pid), (
+                "tool child must survive the no-op signal for this probe"
+            )
+            assert any(
+                e.kind == "reclaim_deferred"
+                and e.payload.get("reason") == "max_runtime_worker_alive"
+                for e in kb.list_events(conn, tid)
+            ), "survivor must leave a visible reclaim_deferred event"
+
+        assert kbd._pid_alive(child_pid)
+        with kbc.connect() as conn:
+            assert kbd.enforce_max_runtime(conn) == [tid]
+            row = conn.execute(
+                "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            assert row["status"] != "running"
+            assert row["claim_lock"] is None
+        assert not kbd._pid_alive(child_pid), (
+            "tool child survived the real group termination"
+        )
+    finally:
+        _cleanup_group(leader)
+
+
+def _load_dashboard_plugin_module():
+    """Load the dashboard plugin_api the same way the reopen tests do, so the
+    direct status write can be exercised here."""
+    pytest.importorskip("fastapi")
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    spec = importlib.util.spec_from_file_location(
+        "hermes_dashboard_plugin_direct_status_test", plugin_file,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_dashboard_direct_status_reprotects_surviving_worker(
+    kanban_home, monkeypatch,
+):
+    """The dashboard's direct status write is a release site of the same
+    class: it clears the claim in the demotion txn and terminates
+    post-commit. The direct termination entry must carry its task id so the
+    shared drain can re-protect the demoted row — ``ready`` included. A
+    verified death keeps the claim-free demotion unchanged."""
+    mod = _load_dashboard_plugin_module()
+    survivor = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": False,
+    }
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker", lambda *a, **k: dict(survivor)
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="direct-demote", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.status == "running"
+        kbd._set_worker_pid(conn, tid, 424242)
+        prev_lock = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["claim_lock"]
+
+        assert mod._set_status_direct(conn, tid, "ready") is True
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, claim_expires "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] == prev_lock
+        assert row["worker_pid"] == 424242
+        assert row["claim_expires"] is not None
+        deferred = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert (
+            deferred[0].payload.get("reason")
+            == "direct_status_demotion_survived"
+        )
+
+    dead = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": True,
+    }
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker", lambda *a, **k: dict(dead)
+    )
+    with kbc.connect() as conn:
+        tid2 = kb.create_task(
+            conn, title="direct-demote-dead", assignee="worker",
+        )
+        claimed = kb.claim_task(conn, tid2)
+        assert claimed is not None and claimed.status == "running"
+        kbd._set_worker_pid(conn, tid2, 424243)
+
+        assert mod._set_status_direct(conn, tid2, "ready") is True
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+            (tid2,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is None
+        assert row["worker_pid"] is None
+        assert not [
+            e for e in kb.list_events(conn, tid2)
+            if e.kind == "reclaim_deferred"
+        ]
+
+
+def test_dashboard_reopen_via_direct_status_labels_descendant_survivor(
+    kanban_home, monkeypatch,
+):
+    """Reopening a done ancestor through the dashboard's direct status write
+    drains its descendant terminations under the INVALIDATION label, not the
+    direct-demotion label: the two entry paths keep separate list pairs and
+    separate reasons, so a surviving ``running`` descendant records
+    ``invalidation_descendant_survived`` — the same label the standalone
+    invalidation surfaces write — and the demoted ``todo`` row keeps its
+    re-protected claim."""
+    mod = _load_dashboard_plugin_module()
+    survivor = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": False,
+    }
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker", lambda *a, **k: dict(survivor)
+    )
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(
+            conn, title="reopen-ancestor", assignee="planner",
+        )
+        assert kb.complete_task(conn, parent_id, result="done")
+        child_id = kb.create_task(
+            conn, title="running child", assignee="builder", parents=[parent_id],
+        )
+        claimed = kb.claim_task(conn, child_id)
+        assert claimed is not None and claimed.status == "running"
+        kbd._set_worker_pid(conn, child_id, 424244)
+        prev_lock = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (child_id,)
+        ).fetchone()["claim_lock"]
+
+        assert mod._set_status_direct(conn, parent_id, "todo") is True
+
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, claim_expires "
+            "FROM tasks WHERE id = ?",
+            (child_id,),
+        ).fetchone()
+        assert row["status"] == "todo"
+        assert row["claim_lock"] == prev_lock
+        assert row["worker_pid"] == 424244
+        assert row["claim_expires"] is not None
+        deferred = [
+            e for e in kb.list_events(conn, child_id)
+            if e.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert (
+            deferred[0].payload.get("reason")
+            == "invalidation_descendant_survived"
+        )
+        assert not [
+            e for e in kb.list_events(conn, parent_id)
+            if e.kind == "reclaim_deferred"
+        ]
+
+
+def _invalidation_scenario(tmp_path, name, terminate_result, monkeypatch):
+    """Shared setup: done ancestor + running claimed descendant, reopen the
+    ancestor and run the invalidation with the given termination result."""
+    db = kbc.connect(tmp_path / f"kanban-{name}.db")
+    parent_id = kb.create_task(db, title="ancestor", assignee="planner")
+    assert kb.complete_task(db, parent_id, result="done")
+    child_id = kb.create_task(
+        db, title="running child", assignee="builder", parents=[parent_id],
+    )
+    claimed = kb.claim_task(db, child_id)
+    assert claimed is not None and claimed.status == "running"
+    kbd._set_worker_pid(db, child_id, 424242)
+    prev_lock = db.execute(
+        "SELECT claim_lock FROM tasks WHERE id = ?", (child_id,)
+    ).fetchone()["claim_lock"]
+
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker", lambda *a, **k: dict(terminate_result)
+    )
+    with kb.write_txn(db):
+        db.execute(
+            "UPDATE tasks SET status = 'todo', completed_at = NULL WHERE id = ?",
+            (parent_id,),
+        )
+    result = kb.invalidate_descendants_for_parent_reopen(
+        db, parent_id, author="operator",
+    )
+    return db, child_id, prev_lock, result
+
+
+def test_invalidation_reprotects_claim_when_descendant_survives(
+    tmp_path, monkeypatch,
+):
+    """Done-reopen invalidation demotes atomically and terminates
+    post-commit; when the demoted descendant's worker survives, its claim is
+    re-protected on the ``todo`` row (CAS) so the claim-free spawn gate cannot
+    double-spawn beside the survivor."""
+    survivor = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": False,
+    }
+    db, child_id, prev_lock, result = _invalidation_scenario(
+        tmp_path, "survivor", survivor, monkeypatch,
+    )
+    try:
+        assert result["terminations"], "running descendant must be terminated"
+        assert result["termination_task_ids"] == [
+            entry["id"] for entry in result["invalidated"]
+            if entry["prior_status"] == "running"
+        ]
+        row = db.execute(
+            "SELECT status, claim_lock, worker_pid, claim_expires "
+            "FROM tasks WHERE id = ?",
+            (child_id,),
+        ).fetchone()
+        assert row["status"] == "todo"
+        assert row["claim_lock"] == prev_lock
+        assert row["worker_pid"] == 424242
+        assert row["claim_expires"] is not None
+        deferred = [
+            e for e in kb.list_events(db, child_id)
+            if e.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert (
+            deferred[0].payload.get("reason")
+            == "invalidation_descendant_survived"
+        )
+    finally:
+        db.close()
+
+
+def test_invalidation_verified_death_keeps_claim_cleared(tmp_path, monkeypatch):
+    """Counter-case: a verified death keeps today's behaviour — the demoted
+    row stays claim-free and no reclaim_deferred event is written."""
+    dead = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": True,
+    }
+    db, child_id, _prev_lock, _result = _invalidation_scenario(
+        tmp_path, "dead", dead, monkeypatch,
+    )
+    try:
+        row = db.execute(
+            "SELECT status, claim_lock, worker_pid, claim_expires "
+            "FROM tasks WHERE id = ?",
+            (child_id,),
+        ).fetchone()
+        assert row["status"] == "todo"
+        assert row["claim_lock"] is None
+        assert row["worker_pid"] is None
+        assert row["claim_expires"] is None
+        assert not [
+            e for e in kb.list_events(db, child_id)
+            if e.kind == "reclaim_deferred"
+        ]
+    finally:
+        db.close()
+
+
+def test_reprotect_demoted_claim_cas_never_overwrites_foreign_claim(kanban_home):
+    """The CAS re-protection only lands on a claim-free row in a spawnable
+    demotion target (``todo`` / ``ready`` / ``review`` — the dashboard's
+    direct status write demotes to all three) and never overwrites a foreign
+    claim or a non-spawnable state."""
+    termination = {"terminated": False, "group_verified_dead": False}
+    with kbc.connect() as conn:
+        for status in ("todo", "ready", "review"):
+            free_id = kb.create_task(
+                conn, title=f"free-{status}", assignee="worker",
+            )
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?", (status, free_id),
+            )
+            conn.commit()
+            assert kb._reprotect_demoted_claim(
+                conn, free_id, 4242, f"lock-{status}", 1_000, dict(termination)
+            ) is True, status
+            row = conn.execute(
+                "SELECT claim_lock, worker_pid, claim_expires FROM tasks "
+                "WHERE id = ?",
+                (free_id,),
+            ).fetchone()
+            assert row["claim_lock"] == f"lock-{status}"
+            assert row["worker_pid"] == 4242
+            assert row["claim_expires"] == 1_000 + kb.RECLAIM_DEFER_GRACE_SECONDS
+
+        foreign_id = kb.create_task(conn, title="foreign", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', claim_lock = 'foreign-lock' "
+            "WHERE id = ?",
+            (foreign_id,),
+        )
+        conn.commit()
+        assert kb._reprotect_demoted_claim(
+            conn, foreign_id, 4243, "other-lock", 1_000, dict(termination)
+        ) is False
+        assert conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (foreign_id,)
+        ).fetchone()["claim_lock"] == "foreign-lock"
+
+        blocked_id = kb.create_task(conn, title="blocked", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?", (blocked_id,),
+        )
+        conn.commit()
+        assert kb._reprotect_demoted_claim(
+            conn, blocked_id, 4244, "blocked-lock", 1_000, dict(termination)
+        ) is False
+
+
+def test_reclaim_stale_ready_claims_releases_dead_worker_claim(kanban_home):
+    """A stale (expired) claim on a non-running, spawnable row with a dead
+    worker is cleared with a visible ``reclaimed`` event, so the card becomes
+    spawnable again."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale-ready", assignee="worker")
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, 424241)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_expires = ? "
+                "WHERE id = ?",
+                (int(time.time()) - 10, tid),
+            )
+        assert kbd.reclaim_stale_ready_claims(conn) == [tid]
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, last_heartbeat_at "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is None
+        assert row["worker_pid"] is None
+        assert row["last_heartbeat_at"] is None
+        assert any(
+            e.kind == "reclaimed"
+            and e.payload.get("reason") == "stale_claim_on_non_running_task"
+            for e in kb.list_events(conn, tid)
+        )
+
+
+def test_reclaim_stale_ready_claims_holds_surviving_worker(
+    kanban_home, monkeypatch,
+):
+    """A stale claim whose worker SURVIVES the termination attempt keeps its
+    claim (window extended past the liveness-blind orphan-claim sweep later in
+    the same tick) and records no reclaimed event; the termination is retried
+    on a later tick."""
+    survivor = {
+        "termination_attempted": True,
+        "host_local": True,
+        "terminated": True,
+        "group_verified_dead": False,
+    }
+    monkeypatch.setattr(
+        kbd, "_terminate_reclaimed_worker", lambda *a, **k: dict(survivor)
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale-ready-live", assignee="worker")
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, 424242)
+        prev_lock = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["claim_lock"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_expires = ? "
+                "WHERE id = ?",
+                (int(time.time()) - 10, tid),
+            )
+        assert kbd.reclaim_stale_ready_claims(conn) == []
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, claim_expires "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] == prev_lock
+        assert row["worker_pid"] == 424242
+        assert row["claim_expires"] > int(time.time())
+        assert not [
+            e for e in kb.list_events(conn, tid) if e.kind == "reclaimed"
+        ]
+
+
+def test_reclaim_stale_ready_claims_respects_fresh_claim(kanban_home):
+    """A non-expired claim on a non-running row is respected (its window may
+    still be in flight) — no termination attempt, no release."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fresh-claim", assignee="worker")
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, 424245)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_expires = ? "
+                "WHERE id = ?",
+                (int(time.time()) + 3600, tid),
+            )
+        attempted = []
+        monkey_free = kbd._terminate_reclaimed_worker
+        try:
+            kbd._terminate_reclaimed_worker = (  # noqa: B010 — probe hook
+                lambda *a, **k: attempted.append(a) or {}
+            )
+            assert kbd.reclaim_stale_ready_claims(conn) == []
+            assert attempted == []
+        finally:
+            kbd._terminate_reclaimed_worker = monkey_free
+        row = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is not None

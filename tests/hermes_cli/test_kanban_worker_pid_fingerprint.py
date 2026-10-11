@@ -76,7 +76,18 @@ def test_matching_fingerprint_keeps_the_live_worker(board):
 
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET max_runtime_seconds = 1 WHERE id = ?", (tid,))
-    kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    # Verified-death simulation (worker AND group): the pytest process group is
+    # really alive, so the survivor guard would otherwise correctly HOLD the
+    # claim instead of releasing it.
+    original_kbd_alive = kbd._pid_alive
+    original_group = kbd._group_alive
+    kbd._pid_alive = lambda pid: False
+    kbd._group_alive = lambda pid: False
+    try:
+        kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    finally:
+        kbd._pid_alive = original_kbd_alive
+        kbd._group_alive = original_group
     assert killed and killed[0] == (os.getpid(), signal.SIGTERM)
 
 
@@ -136,9 +147,20 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     assert kb.release_stale_claims(conn, signal_fn=sig) == 0
     assert killed == []
     assert kb.get_task(conn, tid).status == "running"
-    # An explicit operator reclaim releases the claim (human override) but still sends nothing.
-    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is True
+    # An explicit operator reclaim is NOT exempt from the release contract:
+    # the unverified-but-live worker keeps its claim (``signal_refused`` means
+    # we cannot prove the pid is not ours — releasing would spawn a duplicate
+    # beside a possibly-live worker); a visible defer event records the hold.
+    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is False
     assert killed == []
+    assert kb.get_task(conn, tid).status == "running"
+    deferred = [
+        e for e in kb.list_events(conn, tid) if e.kind == "reclaim_deferred"
+    ]
+    assert any(
+        d.payload.get("reason") == "manual_reclaim_worker_alive"
+        for d in deferred
+    )
 
     # The process is gone (a dead PID): the row is reclaimed like any dead worker, still no signal.
     tid2 = kb.create_task(conn, title="job2", assignee="worker")

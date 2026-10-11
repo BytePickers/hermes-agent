@@ -724,8 +724,27 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
 def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
-    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
+    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits.
+
+    The direct demotion's worker termination enters the shared survivor-guarded
+    drain WITH its task id (release site of the claim-release class): when the
+    worker survives, the demoted row's claim is re-protected on the demotion
+    target (``ready`` / ``review`` / ``todo``) instead of being silently
+    released beside a live writer.
+
+    The two entry paths into this function drain through SEPARATE list pairs
+    with their own event labels: survivors of the direct demotion record
+    ``direct_status_demotion_survived``, while survivors of the reopen
+    invalidation's descendant terminations record
+    ``invalidation_descendant_survived`` — the same label the standalone
+    invalidation surfaces already write. The branches are mutually exclusive
+    per call (``running`` vs. a terminal prior status), so exactly one of the
+    two drains ever carries entries.
+    """
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    termination_task_ids: list[str] = []
+    reopen_terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    reopen_termination_task_ids: list[str] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
@@ -758,16 +777,27 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
                 conn, task_id, outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)")
             terminations.append((prev["worker_pid"], prev["claim_lock"], prev["worker_started_at"]))
+            # The drain maps survivor -> demoted row by task id; without it the
+            # re-protection could never fire on this surface.
+            termination_task_ids.append(task_id)
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
         if reopening_satisfied_parent:
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
-            # back worker terminations to perform post-commit.
+            # back worker terminations to perform post-commit. DEDICATED lists: their
+            # survivors must record the invalidation label, never the direct-demotion one.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
-            terminations.extend(result["terminations"])
-    for pid, claim_lock, started_at in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+            reopen_terminations.extend(result["terminations"])
+            reopen_termination_task_ids.extend(result["termination_task_ids"])
+    kanban_db._drain_invalidation_terminations(
+        conn, terminations, termination_task_ids,
+        reason="direct_status_demotion_survived",
+    )
+    kanban_db._drain_invalidation_terminations(
+        conn, reopen_terminations, reopen_termination_task_ids,
+        reason="invalidation_descendant_survived",
+    )
     # Re-opening something may have made children stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
