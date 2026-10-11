@@ -2216,6 +2216,79 @@ def test_terminate_reclaimed_worker_kills_surviving_tool_children(tmp_path):
         _cleanup_group(leader)
 
 
+def test_terminate_process_tree_never_signals_a_recycled_pid(monkeypatch):
+    """The wait phase keeps the fingerprint contract: once the leader died
+    mid-wait and a stranger owns its pid, neither the SIGKILL follow-up nor
+    the group sweep fires — a foreign group is never signalled (bare
+    existence never justifies a signal)."""
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        kbd, "_signal_worker_group",
+        lambda p, sig, fn=None: signals.append((p, sig)) or "pid",
+    )
+    # The bare NUMBER is always live here; only the identity probe flips:
+    # the first wait probe still sees our worker, afterwards a stranger.
+    monkeypatch.setattr(kbd._kb, "_pid_alive", lambda p: True)
+    probes = {"n": 0}
+
+    def _recycled(p, started_at):
+        probes["n"] += 1
+        return probes["n"] > 1
+
+    monkeypatch.setattr(kbd, "_pid_recycled", _recycled)
+
+    info = kbd._terminate_process_tree(4242, grace_polls=2, started_at=1700000000)
+
+    assert signals == [(4242, signal.SIGTERM)], "only the entry signal may fire"
+    assert info["terminated"] is True
+    assert info["pid_recycled"] is True
+    assert info["sigkill"] is False
+    assert info["group_verified_dead"] is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_terminate_reclaimed_worker_escalates_fingerprint_matched_worker(tmp_path):
+    """A fingerprint-matched worker that ignores SIGTERM is escalated to
+    SIGKILL: the armored wait must not mistake our own live worker for a
+    stranger, and the escalation still covers the whole group."""
+    ready_file = tmp_path / "sigterm_ignored"
+    leader = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"open({str(ready_file)!r}, 'w').write('ready')\n"
+            "time.sleep(300)\n",
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.time() + 10
+        while not ready_file.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert ready_file.exists(), "leader never installed its SIGTERM guard"
+        from gateway.status import get_process_start_time
+
+        fingerprint = get_process_start_time(leader.pid)
+        assert fingerprint is not None
+
+        info = kbd._terminate_reclaimed_worker(
+            leader.pid, kb._claimer_id(), signal_fn=None, started_at=fingerprint,
+        )
+
+        assert info["termination_attempted"] is True
+        assert info["terminated"] is True
+        assert info["sigkill"] is True
+        assert info.get("group_verified_dead") is True
+        assert info.get("signal_mode") == "group"
+        assert info.get("pid_recycled") is None
+        assert not kbd._pid_alive(leader.pid), "escalated worker survived SIGKILL"
+    finally:
+        _cleanup_group(leader)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
 def test_reclaim_task_defers_then_releases_real_processes(kanban_home, tmp_path):
     """Liveness proof with real processes: leader + tool child survive a no-op

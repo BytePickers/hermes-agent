@@ -571,6 +571,7 @@ def _terminate_process_tree(
     *,
     signal_fn=None,
     grace_polls: int = 10,
+    started_at=None,
 ) -> dict[str, Any]:
     """SIGTERM the worker's process tree, then SIGKILL after a grace window.
 
@@ -583,6 +584,17 @@ def _terminate_process_tree(
     vector). Returns an info dict with ``signal_mode`` ("group"/"pid"),
     ``sigkill`` (bool) and ``group_verified_dead`` (True/False, or None
     when group state is unknowable on this platform).
+
+    ``started_at`` is the spawn-time fingerprint carried through from the
+    reclaim row (same contract as :func:`_worker_alive`): every wait probe
+    and every further group signal re-verifies the worker identity — bare
+    existence never justifies a signal (#99558). When the leader dies and
+    its pid is recycled mid-wait, the sweep aborts with ``terminated=True``
+    and ``pid_recycled=True``: the worker is gone (which is what the
+    termination wanted) and a stranger's group is never signalled. A
+    legacy row without a fingerprint keeps the bare-existence answer, and
+    UNVERIFIED spawns must be resolved by the caller before any signal
+    (:func:`_terminate_reclaimed_worker` refuses them at its entry).
     """
     info: dict[str, Any] = {
         "terminated": False,
@@ -606,19 +618,29 @@ def _terminate_process_tree(
         return info
 
     for _ in range(grace_polls):
-        if not _pid_alive(pid):
+        if not _worker_alive(pid, started_at):
             break
         time.sleep(0.5)
 
-    if _pid_alive(pid):
+    if _worker_alive(pid, started_at):
         try:
             _signal_worker_group(pid, _kill_signal, signal_fn)
             info["sigkill"] = True
         except (ProcessLookupError, OSError):
             pass
+    elif _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
+        # The leader died inside the grace window and a stranger now owns the
+        # pid: the worker is gone (which is what the termination wanted) and
+        # any further signal on the bare number could hit the stranger's
+        # group. Abort — a foreign group is never signalled.
+        info["terminated"] = True
+        info["pid_recycled"] = True
+        return info
 
     # The leader can die on SIGTERM while a tool child survives in the same
-    # group. Verify the GROUP is gone and sweep survivors.
+    # group. Verify the GROUP is gone and sweep survivors — but only while
+    # the pid still identifies our worker: a mid-wait recycled number would
+    # route the group signal into a stranger's group (re-checked above).
     alive = _group_alive(pid)
     if alive:
         try:
@@ -634,7 +656,7 @@ def _terminate_process_tree(
     if alive is not None:
         info["group_verified_dead"] = not alive
 
-    info["terminated"] = not _pid_alive(pid)
+    info["terminated"] = not _worker_alive(pid, started_at)
     return info
 
 
@@ -684,7 +706,7 @@ def _terminate_reclaimed_worker(
         return info
 
     info["termination_attempted"] = True
-    info.update(_terminate_process_tree(int(pid), signal_fn=signal_fn))
+    info.update(_terminate_process_tree(int(pid), signal_fn=signal_fn, started_at=started_at))
     return info
 
 
