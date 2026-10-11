@@ -1210,3 +1210,109 @@ def test_attention_surfaces_exclude_terminal_cards(client, kanban_home):
     single = client.get(f"/api/plugins/kanban/tasks/{a_id}").json()
     kinds = [d["kind"] for d in single["task"].get("diagnostics", [])]
     assert "prose_phantom_refs" in kinds
+
+
+# ---------------------------------------------------------------------------
+# GET /board — done column paginated (t_7b8d2a65 point 5)
+#
+# The done column is completion history: with thousands of completed cards it
+# dominated the refresh payload (~19 MB serialized). The board serves a window
+# (default 50) without card bodies; done_total + done_offset page deeper and
+# every other column is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _seed_board_with_done_cards(client, n_done=120, n_open=3):
+    """Create ``n_done`` done cards with long bodies and ``n_open`` open cards.
+
+    complete_task stamps one wall clock, so same-second completions would tie
+    on the newest-completed-first order — pin distinct ``completed_at`` values
+    (later seed position finishes later, like real history).
+    """
+    done_ids = []
+    for i in range(n_done):
+        tid = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"done-{i:03d}", "body": "A" * 2400 + f" #{i}",
+                  "assignee": "infra-build", "priority": 200 - i},
+        ).json()["task"]["id"]
+        r = client.patch(f"/api/plugins/kanban/tasks/{tid}",
+                         json={"status": "done", "result": "done"})
+        assert r.status_code == 200, r.text
+        done_ids.append(tid)
+    open_ids = []
+    for i in range(n_open):
+        open_ids.append(client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"open-{i}", "body": "B" * 2400 + f" #{i}", "assignee": "planner"},
+        ).json()["task"]["id"])
+    with kbc.connect() as conn:
+        for pos, tid in enumerate(done_ids):
+            conn.execute("UPDATE tasks SET completed_at = ? WHERE id = ?", (1_000_000 + pos, tid))
+        conn.commit()
+    return done_ids, open_ids
+
+
+def _board_columns(data):
+    return {c["name"]: c["tasks"] for c in data["columns"]}
+
+
+def test_board_done_column_paginated_default_50(client):
+    done_ids, open_ids = _seed_board_with_done_cards(client)
+    expected = list(reversed(done_ids))  # newest-completed-first
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    cols = _board_columns(data)
+
+    done = cols["done"]
+    assert len(done) == 50
+    assert [c["id"] for c in done] == expected[:50]
+    # Done cards carry no body (full text via /tasks/:id).
+    assert all("body" not in c for c in done)
+
+    # Open columns keep the body unchanged.
+    ready = cols["ready"]
+    assert {c["id"] for c in ready} == set(open_ids)
+    for card in ready:
+        assert card["body"].startswith("BBBB")
+
+    assert data["done_pagination"] == {"total": 120, "offset": 0, "limit": 50}
+
+
+def test_board_done_offset_loads_next_page(client):
+    done_ids, _ = _seed_board_with_done_cards(client)
+    expected = list(reversed(done_ids))
+
+    r = client.get("/api/plugins/kanban/board", params={"done_offset": 50})
+    assert r.status_code == 200
+    data = r.json()
+    done = _board_columns(data)["done"]
+    assert [c["id"] for c in done] == expected[50:100]
+    assert data["done_pagination"] == {"total": 120, "offset": 50, "limit": 50}
+
+    r = client.get("/api/plugins/kanban/board", params={"done_offset": 100})
+    assert r.status_code == 200
+    data = r.json()
+    done = _board_columns(data)["done"]
+    assert [c["id"] for c in done] == expected[100:]
+    assert data["done_pagination"]["offset"] == 100
+
+
+def test_board_done_limit_is_capped(client):
+    done_ids, _ = _seed_board_with_done_cards(client)
+
+    r = client.get("/api/plugins/kanban/board", params={"done_limit": 200})
+    assert r.status_code == 200
+    data = r.json()
+    done = _board_columns(data)["done"]
+    assert len(done) == 120
+    assert {c["id"] for c in done} == set(done_ids)
+    assert data["done_pagination"] == {"total": 120, "offset": 0, "limit": 200}
+
+    # The serialized default response stays compact (refresh under 1 MB).
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    raw = json.dumps(r.json())
+    assert len(raw) < 1_000_000

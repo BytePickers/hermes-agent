@@ -289,7 +289,19 @@ def get_board(
     include_archived: bool = Query(False),
     board: Optional[str] = _BOARD_Q,
     workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
-    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key")):
+    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
+    done_limit: int = Query(
+        50, ge=1, le=200,
+        description=(
+            "Max done cards per board read (t_7b8d2a65 point 5): the done column is "
+            "completion history and grows without bound, dominating the refresh "
+            "payload. Page deeper with done_offset; full text stays on /tasks/:id."
+        ),
+    ),
+    done_offset: int = Query(
+        0, ge=0,
+        description="Offset into the done column (newest-completed-first).",
+    )):
     """Full board grouped by status column; omitting ``board`` uses the active board
     (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``)."""
     with _board_conn(board) as (board, conn):
@@ -332,13 +344,26 @@ def get_board(
         columns["done"].sort(key=lambda d: d["id"], reverse=True)
         columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
 
+        # Done column is paginated (t_7b8d2a65 point 5): with thousands of
+        # completed cards the full history dominated the refresh payload
+        # (~19 MB). Serve one window (default 50) without card bodies — the
+        # full text stays on /tasks/:id; done_total + done_offset let clients
+        # page deeper. Every other column is unchanged.
+        done_tasks = columns["done"]
+        done_total = len(done_tasks)
+        columns["done"] = [
+            {k: v for k, v in d.items() if k != "body"}
+            for d in done_tasks[done_offset:done_offset + done_limit]
+        ]
+
         # Queue columns keep list_tasks' dispatch order (priority DESC, created_at ASC).
         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
         assignees = [r["assignee"] for r in conn.execute(
             "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
         return {
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
-            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
+            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time()),
+            "done_pagination": {"total": done_total, "offset": int(done_offset), "limit": int(done_limit)}}
 
 
 _read_board = coalesced_read(get_board)
@@ -351,6 +376,8 @@ async def get_board_endpoint(
     board: Optional[str] = _BOARD_Q,
     workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
+    done_limit: int = Query(50, ge=1, le=200),
+    done_offset: int = Query(0, ge=0),
 ):
     # Resolve selection before keying so a board switch cannot join an older read.
     return await _read_board(
@@ -359,6 +386,8 @@ async def get_board_endpoint(
         board=board or kanban_db.get_current_board(),
         workflow_template_id=workflow_template_id,
         current_step_key=current_step_key,
+        done_limit=done_limit,
+        done_offset=done_offset,
     )
 
 
