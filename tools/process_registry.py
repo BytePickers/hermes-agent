@@ -491,10 +491,12 @@ def _not_found(session_id: str) -> dict:
         "status": "not_found",
         "error": (
             f"No process with ID '{session_id}'. "
-            "Correct call: process(action='poll'|'log'|'wait'|'kill', session_id='<ID>') — "
+            "Correct call: process(action='poll', session_id='<ID>') — "
             "the session_id comes from the terminal tool's background result "
             "(field session_id). A unique ID prefix works too (e.g. '4dae' "
-            "for proc_4dae56ca81f6). Active IDs: process(action='list')."
+            "for proc_4dae56ca81f6). To send stdin: process(action='write', "
+            "session_id='<ID>', data='<text>') (also 'submit' for text + "
+            "Enter, 'close' for EOF). Active IDs: process(action='list')."
         ),
     }
 

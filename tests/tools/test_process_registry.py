@@ -3153,6 +3153,18 @@ class TestNotFoundCallFormHint:
         assert "session_id='<ID>'" in result["error"]
         assert "process(action='list')" in result["error"]
 
+    def test_not_found_shows_concrete_example_form(self, registry):
+        """R1-B1 regression: the not_found hint must name a single concrete
+        call form (one enum value), not a union like poll'|'log'|'wait'|'kill',
+        and must cover the stdin actions that share this path."""
+        result = registry.poll("proc_nosuch1234")
+        assert result["status"] == "not_found"
+        # Exactly one concrete example form, no union syntax.
+        assert "process(action='poll', session_id='<ID>')" in result["error"]
+        assert "poll'|'log" not in result["error"]
+        # Stdin actions reaching the same helper get a concrete form too.
+        assert "process(action='write', session_id='<ID>', data='<text>')" in result["error"]
+
     def test_wait_not_found_shows_call_form(self, registry):
         result = registry.wait("proc_nosuch1234", timeout=1)
         assert result["status"] == "not_found"
