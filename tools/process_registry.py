@@ -480,7 +480,23 @@ def format_uptime_short(seconds: int) -> str:
 
 
 def _not_found(session_id: str) -> dict:
-    return {"status": "not_found", "error": f"No process with ID {session_id}"}
+    """Standard ``not_found`` result for an unknown/stale process session ID.
+
+    The message teaches the correct call form instead of only naming the
+    failure: agents repeatedly retry with stale or mis-shaped IDs and used to
+    get just "No process with ID <id>", with no hint how to call the tool.
+    Action and field names mirror PROCESS_SCHEMA exactly.
+    """
+    return {
+        "status": "not_found",
+        "error": (
+            f"No process with ID '{session_id}'. "
+            "Correct call: process(action='poll'|'log'|'wait'|'kill', session_id='<ID>') — "
+            "the session_id comes from the terminal tool's background result "
+            "(field session_id). A unique ID prefix works too (e.g. '4dae' "
+            "for proc_4dae56ca81f6). Active IDs: process(action='list')."
+        ),
+    }
 
 
 def _output_tail(session: "ProcessSession", n: int) -> str:
@@ -2612,15 +2628,29 @@ def _handle_process(args, **kw):
         return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
     if action == "handoff":
         if not session_id:
-            return tool_error("session_id is required for handoff")
+            return tool_error(
+                "session_id is required for handoff. "
+                "Correct call: process(action='handoff', session_id='<ID>') — "
+                "IDs come from the terminal tool's background result (field "
+                "session_id) or from process(action='list')."
+            )
         return json.dumps(_handoff_process(session_id, args, kw.get("task_id")), ensure_ascii=False)
     if action in _SESSION_ACTIONS:
         if not session_id:
-            return tool_error(f"session_id is required for {action}")
+            return tool_error(
+                f"session_id is required for {action}. "
+                "Correct call: process(action='" + action + "', session_id='<ID>') — "
+                "IDs come from the terminal tool's background result (field "
+                "session_id) or from process(action='list')."
+            )
         handler, redact = _SESSION_ACTIONS[action]
         result = handler(session_id, args)
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+    return tool_error(
+        f"Unknown process action: {action}. Use: list, poll, log, wait, kill, "
+        "write, submit, close, handoff — e.g. process(action='poll', "
+        "session_id='<ID>'); process(action='list') shows the active IDs."
+    )
 
 
 registry.register(
