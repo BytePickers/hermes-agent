@@ -1661,6 +1661,175 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     h.unmount()
   })
 
+  it('a successful local delete inside the write window suppresses the failed-move restore (no ghost)', async () => {
+    // A DELETE leaves NO WS event (kanban_db.delete_task hard-deletes the
+    // task without appending a task_event), so the membership counter
+    // cannot see it. A successful delete inside a failed write's window
+    // means the card no longer exists server-side — the restore must not
+    // resurrect the frozen extra-page copy.
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    // Move d2 (extra-page card) to todo; the PATCH is parked and will fail.
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+
+    // While the write is in flight, d2 is deleted LOCALLY through the
+    // confirm dialog: the DELETE succeeds (no WS event), the held extras
+    // are pruned and the board refreshed.
+    h.boardColumnsProps().onDelete('d2')
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+    expect(h.callsTo('/tasks/d2').some((c) => (c.opts && c.opts.method) === 'DELETE')).toBe(true)
+
+    // The parked PATCH now fails — d2 must stay gone.
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    // No ghost: d2 was deleted and the restore skipped it. d1 was never
+    // touched and stays held; d0 is the first page.
+    expect(h.doneIds()).toEqual(['d0', 'd1'])
+    h.unmount()
+  })
+
+  it('a FAILED local delete inside the write window does not suppress the failed-move restore', async () => {
+    // Over-suppression guard: a delete that FAILS never removed the card —
+    // d2 keeps its done membership, nothing is counted (see doneDeletesRef),
+    // and the restore must still fire when the parked PATCH fails.
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    server.setDeleteFailures(['d2'])
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+
+    // The delete attempt fails server-side — d2 still exists and is still
+    // done; the held extras still carry it (no prune on failure).
+    h.boardColumnsProps().onDelete('d2')
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+    expect(h.callsTo('/tasks/d2').some((c) => (c.opts && c.opts.method) === 'DELETE')).toBe(true)
+    // d2 was pruned at MOVE dispatch (not by the failed delete) and its
+    // restore has not fired yet — it must still be absent here.
+    expect(h.doneIds()).toEqual(['d0', 'd1'])
+
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    // The restore fired: d2 is back in the merged done column.
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+    h.unmount()
+  })
+
+  it('a successful local delete inside a bulk move write window suppresses the restore of the deleted id (no ghost)', async () => {
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    // Bulk-move d1 + d2; the bulk response is parked (d1 will succeed,
+    // d2 will fail per setWriteFailures).
+    h.boardColumnsProps().toggleSelected('d1')
+    await h.flush()
+    h.boardColumnsProps().toggleSelected('d2', true)
+    await h.flush()
+    h.boardColumnsProps().onMoveSelected('todo')
+    await h.flush()
+
+    // Inside the parked write window, d2 is deleted LOCALLY (successful
+    // DELETE, no WS event). The bulk response then lands: d1 moved, d2
+    // "failed" — but d2 no longer exists server-side, so its restore must
+    // be suppressed instead of resurrecting the frozen extra copy.
+    h.boardColumnsProps().onDelete('d2')
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+
+    server.releaseDeferred('/tasks/bulk')
+    await h.flush()
+
+    const bulk = h.callsTo('/tasks/bulk')[0]
+    expect(bulk).toBeTruthy()
+    expect(JSON.parse(bulk!.opts.body).ids.sort()).toEqual(['d1', 'd2'])
+    // No ghost: d1 moved (it lives beyond the first page again until the
+    // next load-more), d2 was deleted — the restore skipped it, so only
+    // the first-page card remains.
+    expect(h.doneIds()).toEqual(['d0'])
+    h.unmount()
+  })
+
+  it('a successful local delete inside an applyBulk write window suppresses the restore of the deleted id (no ghost)', async () => {
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    h.boardColumnsProps().toggleSelected('d1')
+    await h.flush()
+    h.boardColumnsProps().toggleSelected('d2', true)
+    await h.flush()
+    h.nodeWithProp('onApply').onApply({ status: 'todo' })
+    await h.flush()
+
+    // Same race through the third restore path (applyBulk
+    // restoreFailedExtras): d2 deleted inside the parked window, then the
+    // bulk response lands with d2 marked failed.
+    h.boardColumnsProps().onDelete('d2')
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+
+    server.releaseDeferred('/tasks/bulk')
+    await h.flush()
+
+    // No ghost: d1 moved, d2 deleted and NOT restored — only the
+    // first-page card remains.
+    expect(h.doneIds()).toEqual(['d0'])
+    h.unmount()
+  })
+
   it('a /board response built before a membership mutation is discarded when it lands after the mutation (no ghost in the first done page)', async () => {
     // Second open card so the pre-mutation read is a BULK write's refresh
     // (which exists on every code path — see bulk .then refresh); d0 is the

@@ -1024,6 +1024,16 @@
     // count, not a single "something changed" flag.
     const doneMembershipEventsRef = useRef({});
 
+    // Same window-guard class for LOCAL deletes: a DELETE that succeeded
+    // inside a failed-write's window leaves no WS event at all (the core
+    // hard-deletes the task without appending a task_event), so the
+    // membership counter above cannot see it. Successful deletes are
+    // counted per id here; a restore skips ids whose delete count changed
+    // since its dispatch — the deleted card is gone server-side and
+    // resurrecting the frozen extra copy would be a ghost. Failed deletes
+    // never count: the card still exists and the restore must still fire.
+    const doneDeletesRef = useRef({});
+
     // Extra done pages are fetched per board/filter scope — drop them when
     // the scope changes so stale pages from another board or filter never
     // bleed into the merged done column. The scope generation bump also
@@ -1360,6 +1370,13 @@
         for (const id of ids) {
           membershipCountAtDispatch[id] = doneMembershipEventsRef.current[id] || 0;
         }
+        // Same window guard for LOCAL deletes (see doneDeletesRef): a
+        // delete that succeeded inside this write window leaves no WS
+        // event — the restore must not resurrect a deleted card.
+        const deleteCountAtDispatch = {};
+        for (const id of ids) {
+          deleteCountAtDispatch[id] = doneDeletesRef.current[id] || 0;
+        }
         const restoreFailedExtras = function (failedIdSet) {
           if (!failedIdSet || failedIdSet.size === 0) return;
           if (!scopeGenRef.current.accepts(writeScopeGen)) return;
@@ -1369,7 +1386,8 @@
             // the server's done membership changed under the frozen copy
             // (e.g. a foreign archive) — the WS prune already removed it,
             // restoring it would resurrect a ghost.
-            return (doneMembershipEventsRef.current[tk.id] || 0) === membershipCountAtDispatch[tk.id];
+            return (doneMembershipEventsRef.current[tk.id] || 0) === membershipCountAtDispatch[tk.id]
+              && (doneDeletesRef.current[tk.id] || 0) === deleteCountAtDispatch[tk.id];
           });
           if (tasks.length) {
             setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
@@ -1438,6 +1456,10 @@
       // completion) — the restore must not resurrect it (see
       // doneMembershipEventsRef).
       const membershipCountAtDispatch = doneMembershipEventsRef.current[taskId] || 0;
+      // Same window guard for LOCAL deletes (see doneDeletesRef): a delete
+      // that succeeded inside this write window leaves no WS event — the
+      // restore must not resurrect a card that no longer exists.
+      const deleteCountAtDispatch = doneDeletesRef.current[taskId] || 0;
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -1455,7 +1477,8 @@
         // server's done membership changed under the frozen copy and the WS
         // prune already removed it (restoring would resurrect a ghost).
         if (scopeGenRef.current.accepts(writeScopeGen)
-            && (doneMembershipEventsRef.current[taskId] || 0) === membershipCountAtDispatch) {
+            && (doneMembershipEventsRef.current[taskId] || 0) === membershipCountAtDispatch
+            && (doneDeletesRef.current[taskId] || 0) === deleteCountAtDispatch) {
           const restoreTasks = dispatchedExtra.filter(function (tk) {
             return tk && tk.id === taskId;
           });
@@ -1689,6 +1712,13 @@
         for (const id of Array.from(selectedIds)) {
           membershipCountAtDispatch[id] = doneMembershipEventsRef.current[id] || 0;
         }
+        // Same window guard for LOCAL deletes (see doneDeletesRef): a
+        // delete that succeeded inside this write window leaves no WS
+        // event — the restore must not resurrect a deleted card.
+        const deleteCountAtDispatch = {};
+        for (const id of Array.from(selectedIds)) {
+          deleteCountAtDispatch[id] = doneDeletesRef.current[id] || 0;
+        }
         const restoreFailedExtras = function (failedIdSet) {
           if (!changesDoneMembership) return;
           if (!failedIdSet || failedIdSet.size === 0) return;
@@ -1699,7 +1729,8 @@
             // the server's done membership changed under the frozen copy
             // (e.g. a foreign archive) — the WS prune already removed it,
             // restoring it would resurrect a ghost.
-            return (doneMembershipEventsRef.current[tk.id] || 0) === membershipCountAtDispatch[tk.id];
+            return (doneMembershipEventsRef.current[tk.id] || 0) === membershipCountAtDispatch[tk.id]
+              && (doneDeletesRef.current[tk.id] || 0) === deleteCountAtDispatch[tk.id];
           });
           if (tasks.length) {
             setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
@@ -1840,6 +1871,10 @@
       return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
         method: "DELETE",
       }).then(function () {
+        // Count the successful delete per id (see doneDeletesRef): the
+        // failed-write restores must not resurrect this card if one of
+        // their windows overlaps this delete.
+        doneDeletesRef.current[taskId] = (doneDeletesRef.current[taskId] || 0) + 1;
         // Deleted cards must also leave the held extra done pages, or the
         // merge resurrects them (same ghost-card class as moves). refreshBoard
         // (not the dispatch-time loadBoard): a scope switch while the DELETE
@@ -1879,7 +1914,13 @@
           const deletedIds = [];
           const failed = [];
           results.forEach(function (res, i) {
-            if (res.status === "fulfilled") deletedIds.push(ids[i]);
+            if (res.status === "fulfilled") {
+              deletedIds.push(ids[i]);
+              // Count the successful delete per id (see doneDeletesRef):
+              // failed-write restores must not resurrect this card if one
+              // of their windows overlaps this delete.
+              doneDeletesRef.current[ids[i]] = (doneDeletesRef.current[ids[i]] || 0) + 1;
+            }
             else failed.push({ id: ids[i], error: res.reason });
           });
           if (deletedIds.length) {
