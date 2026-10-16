@@ -2143,12 +2143,18 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
   it('a move PATCH parked across a board switch must not corrupt the new scope (pre-commit block + scope-guarded prune)', async () => {
     // The single move's success handler prunes the written id by raw id.
     // Across a board switch the same id is a DIFFERENT card (one kanban_db
-    // file per board) — the prune is bound to the dispatch scope. The
-    // pre-commit window also blocks load-more while the write is in flight,
-    // so the new scope cannot even build held extra pages for a late stale
-    // success to erase — the guard here is the second belt (the reachable
-    // carriers of this ghost class — WS frame, drawer PATCH, DELETE — are
-    // pinned by their own guard-dependent tests below/above).
+    // file per board) — the prune is bound to the dispatch scope.
+    //
+    // Structural closure of this path (why the pin cannot distinguish a
+    // guarded from an unguarded prune, and why the guard is still bound):
+    // (1) the pre-commit window blocks load-more while the write is in
+    // flight (asserted below), so the new scope cannot even build held extra
+    // pages for a late stale success to erase; (2) the scope reset effect
+    // empties extraDone at the switch (asserted below), so the late prune
+    // always lands in empty pages. The dispatch-scope guard is the second
+    // belt for the day the block is ever loosened; the REACHABLE carriers of
+    // this ghost class (WS frame, drawer PATCH, DELETE) are pinned by their
+    // own guard-dependent tests.
     const server = createServer()
     server.setDeferWrites(true)
     const h = mount(server)
@@ -2179,12 +2185,27 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     server.releaseDeferred('/tasks/d2')
     await h.flush()
     expect(h.doneIds()).toEqual(['d1'])
+
+    // The pre-commit window ENDS with the write: load-more is usable again
+    // (lock released, no deadlock) and the scope stays fully functional.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+    expect(h.doneIds()).toEqual(['d1'])
     h.unmount()
   })
 
   it('a bulk move parked across a board switch must not corrupt the new scope either', async () => {
     // Sibling path: performMoveTask's bulk success handler prunes every
     // ok-id by raw id — same dispatch-scope binding required.
+    //
+    // Structural closure as in the single-move pin above: the pre-commit
+    // block (asserted below) keeps the new scope from building held extra
+    // pages during the write window, and the scope reset empties extraDone
+    // at the switch — the late prune always lands in empty pages, so a
+    // guarded and an unguarded prune are behaviorally indistinguishable
+    // here. The guard is the second belt; the reachable carriers (WS frame,
+    // drawer PATCH, DELETE) carry their own guard-dependent tests.
     const server = createServer([doneTask('x1', 100)])
     server.setDeferWrites(true)
     const h = mount(server)
@@ -2222,12 +2243,27 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     server.releaseDeferred('/tasks/bulk')
     await h.flush()
     expect(h.doneIds()).toEqual(['d1'])
+
+    // The pre-commit window ENDS with the write: load-more is usable again
+    // (lock released, no deadlock) and the scope stays fully functional.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+    expect(h.doneIds()).toEqual(['d1'])
     h.unmount()
   })
 
   it('an applyBulk write parked across a board switch must not corrupt the new scope', async () => {
     // Sibling path: applyBulk's success handler prunes every ok-id by raw
     // id — same dispatch-scope binding required.
+    //
+    // Structural closure as in the single-move pin above: the pre-commit
+    // block (asserted below) keeps the new scope from building held extra
+    // pages during the write window, and the scope reset empties extraDone
+    // at the switch — the late prune always lands in empty pages, so a
+    // guarded and an unguarded prune are behaviorally indistinguishable
+    // here. The guard is the second belt; the reachable carriers (WS frame,
+    // drawer PATCH, DELETE) carry their own guard-dependent tests.
     const server = createServer()
     server.setDeferWrites(true)
     const h = mount(server)
@@ -2258,6 +2294,13 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     // must not touch the new scope's held pages.
     server.releaseDeferred('/tasks/bulk')
     await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // The pre-commit window ENDS with the write: load-more is usable again
+    // (lock released, no deadlock) and the scope stays fully functional.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
     expect(h.doneIds()).toEqual(['d1'])
     h.unmount()
   })
@@ -2293,6 +2336,122 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     // The stale frame flushes to board A's old handler now. It must not
     // touch board B's held extra pages (same-id d2 stays held).
     staleWs.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'status' }], cursor: 2 }) })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    h.unmount()
+  })
+
+  it('a WS membership event after a tenant filter switch still prunes and invalidates (socket restarts with the scope)', async () => {
+    // The scope reset effect bumps the scope generation for board AND filter
+    // changes; the socket lifecycle must ride with it. A socket that kept
+    // running across a filter switch would carry a stale scope token — the
+    // guard would discard every membership frame of the still-running socket
+    // and a foreign move of a held extra-page card would survive as a ghost
+    // until the next board switch. The restart previously held only via the
+    // accidental transitive identity chain scheduleReload -> refreshBoard ->
+    // loadBoard([tenantFilter, includeArchived, board]); it is bound
+    // explicitly in the socket effect's deps now (round-15 finding class).
+    const server = createServer([doneTask('d3', 50)])
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    const socketsBefore = h.wsInstances.length
+
+    // Filter switch: scope reset (extras cleared) AND an explicit socket
+    // restart with a fresh scope token.
+    h.nodeWithProp('setTenantFilter').setTenantFilter('infra')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    expect(h.wsInstances.length).toBeGreaterThan(socketsBefore)
+    const currentWs = h.wsInstances[h.wsInstances.length - 1]
+
+    // Rebuild the extra page under the new filter, then park a further
+    // load-more (built pre-event: it would deliver d3).
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    server.setDeferLoadMore(true)
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // A foreign client moves the held d2 out of done; the frame arrives on
+    // the CURRENT socket: prune + invalidation must fire.
+    server.setTaskStatus('d2', 'todo')
+    currentWs.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'status' }], cursor: 7 }) })
+    await h.flush()
+    // Prune fired (d2 left the held extras) and the loading lock released.
+    expect(h.doneIds()).toEqual(['d1'])
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+    // The parked pre-event page lands — it must be discarded (stale gate
+    // token): d2 would come back as a ghost, d3 is a pre-event snapshot.
+    server.releaseDeferred('done_offset')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a WS membership event after an include-archived filter switch still prunes too (socket restarts with the scope)', async () => {
+    // Same class as the tenant filter: the archive toggle is part of the
+    // scope the socket token belongs to.
+    const server = createServer()
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    const socketsBefore = h.wsInstances.length
+
+    h.nodeWithProp('setIncludeArchived').setIncludeArchived(true)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    expect(h.wsInstances.length).toBeGreaterThan(socketsBefore)
+    const currentWs = h.wsInstances[h.wsInstances.length - 1]
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    server.setTaskStatus('d2', 'todo')
+    currentWs.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'status' }], cursor: 7 }) })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a frame flushed from the pre-filter socket after a filter switch is discarded (stale scope token)', async () => {
+    // Symmetric pin for the filter dimension: with the socket restarting on
+    // the switch, a late frame from the PRE-filter socket belongs to the old
+    // scope — its raw-id prune must stay discarded (the fresh socket
+    // re-delivers from the cursor, so nothing is lost). Mirrors the
+    // board-switch negative above for the filter axis.
+    const server = createServer()
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    const staleWs = h.wsInstances[h.wsInstances.length - 1]
+    expect(staleWs).toBeTruthy()
+
+    h.nodeWithProp('setTenantFilter').setTenantFilter('infra')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // The stale frame flushes to the OLD socket's handler now — the guard
+    // must reject it: the rebuilt held page stays intact.
+    staleWs.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'status' }], cursor: 3 }) })
     await h.flush()
     expect(h.doneIds()).toEqual(['d1', 'd2'])
     h.unmount()

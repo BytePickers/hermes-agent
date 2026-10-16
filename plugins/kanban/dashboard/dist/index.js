@@ -1215,11 +1215,18 @@
       // The socket is pinned to THIS board (wsParams.board below); its
       // membership counter keys carry the same board (doneWindowKey) so a
       // message still in flight from a PREVIOUS board's socket cannot
-      // contaminate the new board's restore windows. The scope generation is
-      // captured per socket run: a frame still in flight from THIS socket
-      // when the scope switches (close() is asynchronous — already-received
-      // frames still flush to onmessage) must not prune or invalidate the
-      // NEW scope's state below.
+      // contaminate the new board's restore windows. The socket lifecycle is
+      // bound to the WHOLE filter scope (board, tenant, archive — see the
+      // effect deps below): the scope reset effect bumps the generation for
+      // all three, so the socket must re-open with them and capture a FRESH
+      // scope token. Bound to the board alone, a surviving socket's token
+      // would go stale at the first tenant/archive filter change and the
+      // guard would then discard every membership frame of the still-running
+      // socket — valid updates suppressed, ghosts surviving until the next
+      // board switch. The generation is still captured per socket run: a
+      // frame still in flight from THIS socket when the scope switches
+      // (close() is asynchronous — already-received frames still flush to
+      // onmessage) must not prune or invalidate the NEW scope's state below.
       const wsBoard = board;
       const wsScopeGen = scopeGenRef.current.current();
       function openWs() {
@@ -1335,7 +1342,7 @@
         wsClosedRef.current = true;
         try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
       };
-    }, [!!boardData, board, scheduleReload, invalidateBoardFetches]);
+    }, [!!boardData, board, tenantFilter, includeArchived, scheduleReload, invalidateBoardFetches]);
 
     // --- filtering ----------------------------------------------------------
     const filteredBoard = useMemo(function () {
