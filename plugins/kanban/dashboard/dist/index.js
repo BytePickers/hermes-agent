@@ -892,7 +892,6 @@
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
-    const wsClosedRef = useRef(false);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -1211,7 +1210,20 @@
     // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
       if (!boardData) return undefined;
-      wsClosedRef.current = false;
+      // Per-run lifecycle token: EVERY continuation of THIS effect run
+      // (reconnect timers, parked buildWsUrl resolutions, onclose handlers)
+      // checks its own run's token instead of a shared ref. The previous
+      // shared wsClosedRef was reset to false at the START of every run, so
+      // a late onclose of the OLD socket — close() is asynchronous and the
+      // scope switch does not wait for it — sailed past the guard and
+      // scheduled the OLD run's openWs with old board/filter parameters: a
+      // duplicated socket generation that overwrote wsRef, leaving the
+      // CURRENT socket untracked at the next cleanup (leak, duplicate
+      // frames/events). The token is private to the run: the old run's
+      // cleanup closed it and no newer run can un-close it, while a legit
+      // reconnect inside the SAME run (connection drop, no scope switch)
+      // keeps its own open run token and reconnects as before.
+      const wsRun = { closed: false };
       // The socket is pinned to THIS board (wsParams.board below); its
       // membership counter keys carry the same board (doneWindowKey) so a
       // message still in flight from a PREVIOUS board's socket cannot
@@ -1230,7 +1242,7 @@
       const wsBoard = board;
       const wsScopeGen = scopeGenRef.current.current();
       function openWs() {
-        if (wsClosedRef.current) return;
+        if (wsRun.closed) return;
         // Build the WS URL via the host SDK so the correct auth param is used
         // in BOTH modes: single-use ?ticket= in gated OAuth mode, ?token= in
         // loopback. Reading window.__HERMES_SESSION_TOKEN__ directly (the old
@@ -1246,7 +1258,7 @@
         // Regression: #20879.
         if (board) wsParams.board = board;
         SDK.buildWsUrl(`${API}/events`, wsParams).then(function (url) {
-          if (wsClosedRef.current) return;
+          if (wsRun.closed) return;
           let ws;
           try { ws = new WebSocket(url); } catch (_e) { return; }
           wsRef.current = ws;
@@ -1318,7 +1330,7 @@
             } catch (_e) { /* ignore */ }
           };
           ws.onclose = function (ev) {
-            if (wsClosedRef.current) return;
+            if (wsRun.closed) return;
             if (ev && ev.code === 1008) {
               setError(tx(t, "wsAuthFailed",
                 "WebSocket auth failed — reload the page to refresh the session token."));
@@ -1331,7 +1343,7 @@
         }).catch(function () {
           // Ticket mint / URL build failed (e.g. session expired). Back off
           // and retry; a hard auth failure surfaces via the 1008 close path.
-          if (wsClosedRef.current) return;
+          if (wsRun.closed) return;
           const delay = Math.min(wsBackoffRef.current, 30000);
           wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
           setTimeout(openWs, delay);
@@ -1339,7 +1351,7 @@
       }
       openWs();
       return function () {
-        wsClosedRef.current = true;
+        wsRun.closed = true;
         try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
       };
     }, [!!boardData, board, tenantFilter, includeArchived, scheduleReload, invalidateBoardFetches]);
