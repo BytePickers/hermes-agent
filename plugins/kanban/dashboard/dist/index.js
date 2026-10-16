@@ -1215,8 +1215,13 @@
       // The socket is pinned to THIS board (wsParams.board below); its
       // membership counter keys carry the same board (doneWindowKey) so a
       // message still in flight from a PREVIOUS board's socket cannot
-      // contaminate the new board's restore windows.
+      // contaminate the new board's restore windows. The scope generation is
+      // captured per socket run: a frame still in flight from THIS socket
+      // when the scope switches (close() is asynchronous — already-received
+      // frames still flush to onmessage) must not prune or invalidate the
+      // NEW scope's state below.
       const wsBoard = board;
+      const wsScopeGen = scopeGenRef.current.current();
       function openWs() {
         if (wsClosedRef.current) return;
         // Build the WS URL via the host SDK so the correct auth param is used
@@ -1276,12 +1281,22 @@
                   // column as a ghost. A card that ENTERED done comes back
                   // through the fresh first page — its stale extra copy (old
                   // status) must go for the same reason.
-                  if (membershipTaskIds.length) {
-                    setExtraDone(function (prev) {
-                      return pruneExtraDoneTasks(prev, new Set(membershipTaskIds));
-                    });
+                  // Scope-guarded: a frame still in flight from a PREVIOUS
+                  // scope's socket (see wsScopeGen) belongs to the old scope
+                  // — ids collide across boards, so its raw-id prune would
+                  // erase the NEW board's still-done same-id card from the
+                  // held extras. Counting above stays unconditional: the
+                  // counters are board-keyed (doneWindowKey) and a stale
+                  // board's counts are dead data (the scope reset emptied the
+                  // restore windows they could close).
+                  if (scopeGenRef.current.accepts(wsScopeGen)) {
+                    if (membershipTaskIds.length) {
+                      setExtraDone(function (prev) {
+                        return pruneExtraDoneTasks(prev, new Set(membershipTaskIds));
+                      });
+                    }
+                    invalidateBoardFetches();
                   }
-                  invalidateBoardFetches();
                 }
                 // Stamp per-task signal so the TaskDrawer can reload itself.
                 setTaskEventTick(function (prev) {
@@ -1425,10 +1440,13 @@
           body: JSON.stringify(Object.assign({ ids: ids }, finalPatch)),
         }).then(function (res) {
           const okIds = (res.results || []).filter(function (r) { return r.ok; }).map(function (r) { return r.id; });
-          if (okIds.length > 0) {
+          if (okIds.length > 0 && scopeGenRef.current.accepts(writeScopeGen)) {
             // Successfully written ids have left done server-side — keep the
             // held extra pages free of them (belt and braces beside the
-            // dispatch-time prune above).
+            // dispatch-time prune above). Scope-guarded: a board switch while
+            // the bulk write is in flight must not prune the NEW scope's
+            // extra pages — ids collide across boards, a raw-id prune would
+            // erase the new board's still-done same-id cards.
             setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(okIds)); });
           }
           const failed = (res.results || []).filter(function (r) { return !r.ok; });
@@ -1496,7 +1514,13 @@
       }).then(function () {
         // The card has left done server-side — keep it out of the held extra
         // pages (belt and braces beside the dispatch-time prune above).
-        setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+        // Scope-guarded like the delete success prune: a board switch while
+        // the PATCH is in flight must not prune the NEW scope's extra pages —
+        // ids collide across boards (one kanban_db file per board), so a raw
+        // -id prune would erase the new board's still-done same-id card.
+        if (scopeGenRef.current.accepts(writeScopeGen)) {
+          setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+        }
       }).catch(function (err) {
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         // The write failed: the card is still done server-side and may live
@@ -1776,10 +1800,13 @@
           .then(function (res) {
             if (changesDoneMembership) {
               const okIds = (res.results || []).filter(function (r) { return r.ok; }).map(function (r) { return r.id; });
-              if (okIds.length > 0) {
+              if (okIds.length > 0 && scopeGenRef.current.accepts(writeScopeGen)) {
                 // Successfully written ids have left done server-side — keep
                 // the held extra pages free of them (same belt-and-braces
-                // prune as performMoveTask).
+                // prune as performMoveTask). Scope-guarded: a board switch
+                // while the write is in flight must not prune the NEW scope's
+                // extra pages — ids collide across boards, a raw-id prune
+                // would erase the new board's still-done same-id cards.
                 setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(okIds)); });
               }
             }
@@ -1999,11 +2026,19 @@
     // leave it — the merge would otherwise resurrect it after the refresh.
     // Patches without a membership key (title, priority, assignee, …) keep
     // the held page: the card stays done and must stay visible.
-    const handleDrawerTaskPatched = useCallback(function (taskId, patch) {
+    // The third argument is the dispatch-time scope generation (captured by
+    // the drawer via `captureScopeGen` when it issued the PATCH): a board
+    // switch while the PATCH is in flight must not let the late success
+    // prune the NEW scope's extra pages — ids collide across boards (one
+    // kanban_db file per board), a raw-id prune would erase the new board's
+    // still-done same-id card. Missing token (no captureScopeGen wired)
+    // keeps the old behavior — the guard only tightens when a token exists.
+    const handleDrawerTaskPatched = useCallback(function (taskId, patch, scopeGen) {
       if (!patch) return;
       const changesMembership = Object.prototype.hasOwnProperty.call(patch, "status")
         || Object.prototype.hasOwnProperty.call(patch, "archived");
       if (!changesMembership) return;
+      if (scopeGen != null && !scopeGenRef.current.accepts(scopeGen)) return;
       setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
       invalidateBoardFetches();
     }, [invalidateBoardFetches]);
@@ -2119,6 +2154,13 @@
           onOpenTask: setSelectedTaskId,
           onRefresh: refreshBoard,
           onTaskPatched: handleDrawerTaskPatched,
+          // Dispatch-time scope-generation capture for the drawer's PATCH
+          // paths: the drawer stamps every onTaskPatched callback with the
+          // generation that was current when the PATCH was issued, so the
+          // parent prune above can drop late successes from a switched-away
+          // scope (same-id collision across boards — see
+          // handleDrawerTaskPatched).
+          captureScopeGen: function () { return scopeGenRef.current.current(); },
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
           assignees: (boardData && boardData.assignees) || [],
@@ -2311,7 +2353,7 @@
 
   function DiagnosticCard(props) {
     const { t } = useI18n();
-    const { diag, task, boardSlug, assignees, onRefresh, onTaskPatched } = props;
+    const { diag, task, boardSlug, assignees, onRefresh, onTaskPatched, captureScopeGen } = props;
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState(null);
     const [copiedKey, setCopiedKey] = useState(null);
@@ -2320,8 +2362,12 @@
     // Unblock / reclaim / reassign all flip the task's status to `ready`
     // server-side. If the card lived in a held extra done page, the parent
     // must drop it there (ghost guard — same class as the drawer PATCH).
-    const noteStatusReady = function () {
-      if (onTaskPatched) onTaskPatched(task.id, { status: "ready" });
+    // The parent prune is stamped with the dispatch-time scope generation:
+    // the token is captured when the action's request is ISSUED, so a board
+    // switch while it is in flight makes the late success a no-op in the
+    // NEW scope (ids collide across boards — see handleDrawerTaskPatched).
+    const noteStatusReady = function (scopeGen) {
+      if (onTaskPatched) onTaskPatched(task.id, { status: "ready" }, scopeGen);
     };
 
     const execAction = function (action) {
@@ -2367,6 +2413,8 @@
       }
       if (action.kind === "unblock") {
         setBusy(true); setMsg(null);
+        // Dispatch-time scope token (see noteStatusReady above).
+        const actionScopeGen = captureScopeGen ? captureScopeGen() : null;
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}`, boardSlug);
         SDK.fetchJSON(url, {
           method: "PATCH",
@@ -2377,7 +2425,7 @@
             "Unblocked {id}. Task is ready for the next tick.", { id: task.id }) });
           // Parent invalidation FIRST — the refresh must read the NEW
           // generation (see TaskDetail applyPatch).
-          noteStatusReady();
+          noteStatusReady(actionScopeGen);
           if (onRefresh) onRefresh();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "unblockFailed", "Unblock failed: ") + (err.message || err) });
@@ -2386,6 +2434,8 @@
       }
       if (action.kind === "reclaim") {
         setBusy(true); setMsg(null);
+        // Dispatch-time scope token (see noteStatusReady above).
+        const actionScopeGen = captureScopeGen ? captureScopeGen() : null;
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/reclaim`, boardSlug);
         SDK.fetchJSON(url, {
           method: "POST",
@@ -2396,7 +2446,7 @@
             "Reclaimed {id}. Task is back to ready.", { id: task.id }) });
           // Parent invalidation FIRST — the refresh must read the NEW
           // generation (see TaskDetail applyPatch).
-          noteStatusReady();
+          noteStatusReady(actionScopeGen);
           if (onRefresh) onRefresh();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "reclaimFailed", "Reclaim failed: ") + (err.message || err) });
@@ -2409,6 +2459,8 @@
           return;
         }
         setBusy(true); setMsg(null);
+        // Dispatch-time scope token (see noteStatusReady above).
+        const actionScopeGen = captureScopeGen ? captureScopeGen() : null;
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/reassign`, boardSlug);
         const body = {
           profile: reassignProfile || null,
@@ -2427,7 +2479,7 @@
           });
           // Parent invalidation FIRST — the refresh must read the NEW
           // generation (see TaskDetail applyPatch).
-          noteStatusReady();
+          noteStatusReady(actionScopeGen);
           if (onRefresh) onRefresh();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "reassignFailed", "Reassign failed: ") + (err.message || err) });
@@ -2557,6 +2609,7 @@
                 assignees: props.assignees,
                 onRefresh: props.onRefresh,
                 onTaskPatched: props.onTaskPatched,
+                captureScopeGen: props.captureScopeGen,
               });
             }),
           )
@@ -4454,6 +4507,12 @@
         const finalPatch = withCompletionSummary(patch);
         if (!finalPatch) return Promise.resolve();
         setPatchErr(null);
+        // Dispatch-time scope generation: the parent prune (onTaskPatched
+        // below) is stamped with the scope that was current when THIS PATCH
+        // was issued — a board switch while it is in flight makes the late
+        // success a no-op in the NEW scope (ids collide across boards — see
+        // handleDrawerTaskPatched).
+        const patchScopeGen = props.captureScopeGen ? props.captureScopeGen() : null;
         return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -4464,7 +4523,7 @@
           // extra pages and invalidate in-flight fetches) — the parent
           // refresh below must read the NEW generation, or its response
           // would be discarded as stale and the board would never refresh.
-          if (props.onTaskPatched) props.onTaskPatched(props.taskId, finalPatch);
+          if (props.onTaskPatched) props.onTaskPatched(props.taskId, finalPatch, patchScopeGen);
           props.onRefresh();
         })
           .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); });
@@ -4625,6 +4684,7 @@
           onSpecify: doSpecify,
           onDecompose: doDecompose,
           onTaskPatched: props.onTaskPatched,
+          captureScopeGen: props.captureScopeGen,
           onAddParent: addLink,
           onRemoveParent: removeLink,
           onAddChild: addChild,
@@ -4854,6 +4914,7 @@
         diagnostics: t.diagnostics || [],
         onRefresh: props.onRefresh,
         onTaskPatched: props.onTaskPatched,
+        captureScopeGen: props.captureScopeGen,
       }),
       h(HomeSubsSection, {
         homeChannels: props.homeChannels || [],

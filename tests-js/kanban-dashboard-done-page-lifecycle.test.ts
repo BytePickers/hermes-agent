@@ -2139,4 +2139,247 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
     h.unmount()
   })
+
+  it('a move PATCH parked across a board switch must not corrupt the new scope (pre-commit block + scope-guarded prune)', async () => {
+    // The single move's success handler prunes the written id by raw id.
+    // Across a board switch the same id is a DIFFERENT card (one kanban_db
+    // file per board) — the prune is bound to the dispatch scope. The
+    // pre-commit window also blocks load-more while the write is in flight,
+    // so the new scope cannot even build held extra pages for a late stale
+    // success to erase — the guard here is the second belt (the reachable
+    // carriers of this ghost class — WS frame, drawer PATCH, DELETE — are
+    // pinned by their own guard-dependent tests below/above).
+    const server = createServer()
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Board A: load the extra page and move d2 out of done (PATCH parked).
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+    expect(h.callsTo('/tasks/d2').some((c) => (c.opts && c.opts.method) === 'PATCH')).toBe(true)
+
+    // Switch to board B while the PATCH is in flight: load-more must stay
+    // blocked for the whole pre-commit window.
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    const offsetCallsBefore = h.callsTo('done_offset').length
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore)
+
+    // The parked PATCH settles — board A's success. The scope-guarded prune
+    // must not touch the new scope; the refresh reflects the post-write
+    // truth — no ghost, no crash.
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a bulk move parked across a board switch must not corrupt the new scope either', async () => {
+    // Sibling path: performMoveTask's bulk success handler prunes every
+    // ok-id by raw id — same dispatch-scope binding required.
+    const server = createServer([doneTask('x1', 100)])
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2', 'x1'])
+
+    // Board A: select both extra-page cards and bulk-move them (parked).
+    h.boardColumnsProps().toggleSelected('d2')
+    await h.flush()
+    h.boardColumnsProps().toggleSelected('x1', true)
+    await h.flush()
+    h.boardColumnsProps().onMoveSelected('todo')
+    await h.flush()
+    const bulk = h.callsTo('/tasks/bulk')[0]
+    expect(bulk).toBeTruthy()
+    expect(JSON.parse(bulk!.opts.body).ids).toEqual(['d2', 'x1'])
+
+    // Switch to board B while the bulk write is in flight: load-more stays
+    // blocked for the whole pre-commit window.
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    const offsetCallsBefore = h.callsTo('done_offset').length
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore)
+
+    // The parked bulk write settles — board A's success. The scope-guarded
+    // prune must not touch the new scope's held pages.
+    server.releaseDeferred('/tasks/bulk')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('an applyBulk write parked across a board switch must not corrupt the new scope', async () => {
+    // Sibling path: applyBulk's success handler prunes every ok-id by raw
+    // id — same dispatch-scope binding required.
+    const server = createServer()
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Board A: select the extra-page card and apply a status patch (parked).
+    h.boardColumnsProps().toggleSelected('d2')
+    await h.flush()
+    h.nodeWithProp('onApply').onApply({ status: 'todo' })
+    await h.flush()
+    expect(h.callsTo('/tasks/bulk').length).toBeGreaterThan(0)
+
+    // Switch to board B while the write is in flight: load-more stays
+    // blocked for the whole pre-commit window.
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    const offsetCallsBefore = h.callsTo('done_offset').length
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore)
+
+    // The parked write settles — board A's success. The scope-guarded prune
+    // must not touch the new scope's held pages.
+    server.releaseDeferred('/tasks/bulk')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a stale WS membership event from the old board\u2019s socket must not prune the new board\u2019s extra pages (same-id collision)', async () => {
+    // The socket is board-pinned and its effect closes it on a board switch,
+    // but close() is asynchronous: a frame already received can still flush
+    // to the OLD handler after the switch. That stale event belongs to the
+    // old scope — its raw-id prune would erase the NEW board's still-done
+    // same-id card from the held extras.
+    const server = createServer()
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Board A: load the extra page. The socket captured here belongs to
+    // board A's scope.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    const staleWs = h.wsInstances[h.wsInstances.length - 1]
+    expect(staleWs).toBeTruthy()
+
+    // Switch to board B and rebuild its held extra page — same ids (the
+    // collision shape).
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // The stale frame flushes to board A's old handler now. It must not
+    // touch board B's held extra pages (same-id d2 stays held).
+    staleWs.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'status' }], cursor: 2 }) })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    h.unmount()
+  })
+
+  it('a drawer patch reported with a stale scope token must not prune the new board\u2019s extra pages (same-id collision)', async () => {
+    // The drawer chain stamps every patch report with the dispatch-time
+    // scope generation (captureScopeGen). A PATCH dispatched on board A
+    // whose success is reported after the switch to board B must be dropped
+    // by the parent prune — ids collide across boards. Drawer patches do
+    // NOT bump the pre-commit write counter, so board B CAN rebuild its
+    // held extra page while the PATCH is in flight — the reachable shape of
+    // this ghost. The same-board negative (current token → prune) is pinned
+    // at the end.
+    const server = createServer()
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Board A: load the extra page, open the drawer for the extra-page card
+    // (the render site wires the prune hook + token capture through), and
+    // capture the dispatch-time token the way applyPatch does when it
+    // issues the PATCH.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    h.boardColumnsProps().onOpen('d2')
+    await h.flush()
+    // Dispatch-time token, captured the way applyPatch does when it issues
+    // the PATCH (undefined only if the chain doesn't stamp tokens — the
+    // mountDrawer contract test pins the stamp itself).
+    const capture = h.taskDrawerProps().captureScopeGen
+    const staleToken = typeof capture === 'function' ? capture() : undefined
+
+    // Switch to board B while the PATCH is in flight; rebuild its held
+    // extra page — same ids (the collision shape).
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // The drawer's patch success is reported now, stamped with the STALE
+    // dispatch-time token — the parent prune must ignore it: board B's
+    // same-id card stays held.
+    h.taskDrawerProps().onTaskPatched('d2', { status: 'todo' }, staleToken)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Negative: the SAME id reported with the CURRENT scope's token (the
+    // ordinary same-board drawer patch) must still prune.
+    h.taskDrawerProps().onTaskPatched('d2', { status: 'todo' }, h.taskDrawerProps().captureScopeGen())
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('drawer patch reports the dispatch-time scope token to the parent (stamped at dispatch, not at response)', async () => {
+    // Contract pin for the real chain: TaskDetail.applyPatch captures the
+    // scope generation when it ISSUES the PATCH and passes it as the third
+    // onTaskPatched argument — a token captured at response time would let a
+    // board switch launder a stale prune into the new scope.
+    const server = createServer()
+
+    let generation = 7
+    const patched: Array<[string, any, unknown]> = []
+
+    const h = mountDrawer(server, {
+      taskId: 'd2',
+      boardSlug: 'default',
+      captureScopeGen: () => generation,
+      onTaskPatched: (taskId: string, patch: any, scopeGen: unknown) => { patched.push([taskId, patch, scopeGen]) },
+    })
+
+    await h.flush()
+
+    // Park the write so dispatch and response are distinct points in time.
+    server.setDeferWrites(true)
+
+    h.detailProps().onPatch({ status: 'todo' })
+    generation = 8 // the scope moves on while the write is in flight
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    expect(patched).toEqual([['d2', { status: 'todo' }, 7]])
+  })
 })
