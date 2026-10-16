@@ -177,11 +177,13 @@
     return Object.assign({}, board, { columns });
   }
 
-  // Generation gate for in-flight "Load more" requests. Each board/filter
-  // scope switch resets the gate; a response fetched before the reset must
-  // never be applied — otherwise the old scope's page (potentially another
-  // tenant's) hangs on the new scope's freshly-cleared extra pages. Pure
-  // state machine so the race decision is testable without React.
+  // Generation gate for in-flight "Load more" requests. Both scope switches
+  // and membership mutations invalidate every outstanding token: a response
+  // fetched before the invalidation must never be applied — otherwise the old
+  // scope's page (potentially another tenant's) hangs on the new scope's
+  // freshly-cleared extra pages, or a page built from pre-mutation server
+  // state resurrects a card the mutation just moved/deleted. Pure state
+  // machine so the race decision is testable without React.
   function createDonePageGate() {
     let generation = 0;
     return {
@@ -759,6 +761,17 @@
     // a scope switch must not be applied to the new scope (see gate below).
     const donePageGateRef = useRef(null);
     if (!donePageGateRef.current) donePageGateRef.current = createDonePageGate();
+    // Invalidate every in-flight "Load more" request and release the loading
+    // lock. Runs on scope switches AND on membership mutations: a page fetched
+    // before a move/delete was built from the pre-mutation server state (with
+    // a pre-mutation offset) and may still contain the very card the mutation
+    // just removed — appending it would resurrect it as a ghost. The stale
+    // request's .finally can no longer release the lock (its token is stale),
+    // so this releases it here.
+    const invalidateDonePageFetches = useCallback(function () {
+      donePageGateRef.current.reset();
+      setDoneLoading(false);
+    }, []);
     const boardData = useMemo(function () {
       return withMergedDoneColumn(kanbanBoard, extraDone);
     }, [kanbanBoard, extraDone]);
@@ -827,10 +840,9 @@
     // bleed into the merged done column. The gate bump also invalidates any
     // in-flight "Load more" response from the old scope.
     useEffect(function () {
-      donePageGateRef.current.reset();
+      invalidateDonePageFetches();
       setExtraDone([]);
-      setDoneLoading(false);
-    }, [board, tenantFilter, includeArchived]);
+    }, [board, tenantFilter, includeArchived, invalidateDonePageFetches]);
 
     // Load the next page of the done column. The offset is how many done
     // cards the client already holds (first page + extras); the server slices
@@ -844,8 +856,9 @@
         .find(function (c) { return c.name === "done"; });
       const paging = donePagingState(pagination, (mergedNow && mergedNow.tasks) || []);
       if (!paging.hasMore) return Promise.resolve();
-      // Token for this request; the reset effect bumps the gate on every
-      // scope change, so a response that lands after a switch is discarded.
+      // Token for this request; the gate is bumped on every scope change AND
+      // on every membership mutation, so a response that lands after either
+      // is discarded.
       const token = donePageGateRef.current.current();
       const qs = new URLSearchParams();
       qs.set("done_offset", String(paging.loaded));
@@ -1031,6 +1044,7 @@
         // Cards that lived only in a loaded done page must also leave the
         // held extras, or the merge resurrects them as ghosts.
         setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, selectedIds); });
+        invalidateDonePageFetches();
         setBoardData(function (b) { return withOptimisticMove(b, selectedIds, newStatus, extraDone); });
         const ids = Array.from(selectedIds);
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
@@ -1057,6 +1071,7 @@
       }
       // Single-task path.
       setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+      invalidateDonePageFetches();
       setBoardData(function (b) { return withOptimisticMove(b, new Set([taskId]), newStatus, extraDone); });
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "PATCH",
@@ -1066,7 +1081,7 @@
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         loadBoard();
       });
-    }, [loadBoard, board, t, selectedIds, extraDone]);
+    }, [loadBoard, board, t, selectedIds, extraDone, invalidateDonePageFetches]);
 
     // Pre-dispatch dialog step for both moveTask and moveSelected. Drives
     // the new in-app ConfirmDialog instead of window.confirm. The flow:
@@ -1258,6 +1273,7 @@
           // Same ghost-card guard as performMoveTask: moved cards must also
           // leave the held extra done pages.
           setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, selectedIds); });
+          invalidateDonePageFetches();
           setBoardData(function (b) { return withOptimisticMove(b, selectedIds, finalPatch.status, extraDone); });
         }
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
@@ -1298,7 +1314,7 @@
       }).then(function (r) {
         if (r.confirmed) run();
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, loadBoard, board, t, kanbanDialogs, extraDone]);
+    }, [selectedIds, loadBoard, board, t, kanbanDialogs, extraDone, invalidateDonePageFetches]);
 
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
@@ -1371,6 +1387,7 @@
         // Deleted cards must also leave the held extra done pages, or the
         // merge resurrects them (same ghost-card class as moves).
         setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+        invalidateDonePageFetches();
         loadBoard();
          setSelectedIds(function (prev) {
            const next = new Set(prev);
@@ -1379,7 +1396,7 @@
          });
        }).catch(function (e) { setError(String(e.message || e)); });
      }).catch(function () { /* cancelled */ });
-   }, [board, loadBoard, t, kanbanDialogs]);
+   }, [board, loadBoard, t, kanbanDialogs, invalidateDonePageFetches]);
 
     const deleteSelected = useCallback(function (count) {
       if (selectedIds.size === 0) return Promise.resolve();
@@ -1409,6 +1426,7 @@
           });
           if (deletedIds.length) {
             setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(deletedIds)); });
+            invalidateDonePageFetches();
             loadBoard();
           }
           if (failed.length) {
@@ -1417,7 +1435,7 @@
           }
         }).catch(function (e) { setError(String(e.message || e)); });
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, board, loadBoard, t, kanbanDialogs]);
+    }, [selectedIds, board, loadBoard, t, kanbanDialogs, invalidateDonePageFetches]);
 
     // A drawer patch that changes a task's status (complete / archive /
     // unblock — every drawer status action rides one PATCH with a `status`
@@ -1432,7 +1450,8 @@
         || Object.prototype.hasOwnProperty.call(patch, "archived");
       if (!changesMembership) return;
       setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
-    }, []);
+      invalidateDonePageFetches();
+    }, [invalidateDonePageFetches]);
 
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {

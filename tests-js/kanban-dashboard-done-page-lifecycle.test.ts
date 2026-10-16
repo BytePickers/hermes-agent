@@ -161,11 +161,12 @@ function createHooksRuntime() {
 // is built at REQUEST time (a real server would compute it then) and handed
 // to the test, which releases it later — the honest shape of the race.
 
-function createServer() {
+function createServer(extraTasks: any[] = []) {
   const tasks = new Map<string, any>([
     ['t1', openTask('t1')],
     ['d1', doneTask('d1', 300)],
     ['d2', doneTask('d2', 200)], // lives on done page 2 (limit-1 window)
+    ...extraTasks.map((t) => [t.id, t] as [string, any]),
   ])
 
   // DELETE ids that fail (partial-failure emulation for bulk delete).
@@ -389,6 +390,10 @@ function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: Re
     // TaskDrawer registers an Escape-key listener on mount.
     addEventListener: () => {},
     removeEventListener: () => {},
+    // Completion-summary carve-out (production uses window.prompt for the
+    // "move to done" summary); tests that drive a move INTO done stub it.
+    prompt: () => 'completion summary from test',
+    alert: () => {},
   }
 
   ;(globalThis as unknown as { window: unknown }).window = win
@@ -738,6 +743,83 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     await h.flush()
     // Without the gate the stale page-2 card would appear here as a ghost.
     expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('load-more response that lands after a same-scope move is discarded (no ghost)', async () => {
+    const server = createServer()
+    server.setDeferLoadMore(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Start the load-more; its response is built from the PRE-mutation server
+    // state (offset 1 -> [d2]) and parked.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // Same-scope membership mutation while the request is in flight: d2 moves
+    // out of done. The mutation must invalidate the in-flight fetch — its
+    // parked page was computed before the move and still contains d2.
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+
+    // The invalidation releases the loading lock (the stale request's
+    // .finally can no longer release it — its token is stale now).
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    expect(JSON.parse(patch!.opts.body)).toEqual({ status: 'todo' })
+
+    // The stale response lands now — it must NOT be appended: d2 would come
+    // back as a ghost into the merged done column. (d2 is not re-shown
+    // anywhere until a refresh — the card lived only in the parked response.)
+    server.releaseDeferred('done_offset')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    expect(h.todoIds()).toEqual(['t1'])
+    h.unmount()
+  })
+
+  it('a membership mutation releases the loading lock; the fresh load-more applies, the stale one does not', async () => {
+    // Extra seed card: three done cards total, so a deeper page still exists
+    // after the mutation deletes one of them.
+    const server = createServer([doneTask('d0', 400)])
+    server.setDeferLoadMore(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    // First load-more in flight, parked (payload [d1], pre-mutation truth).
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // Same-scope membership mutation while the fetch is in flight: d0 is
+    // deleted (confirm dialog). The mutation invalidates the in-flight fetch
+    // and releases the lock.
+    h.boardColumnsProps().onDelete('d0')
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+    expect(h.callsTo('/tasks/d0').some((c) => (c.opts && c.opts.method) === 'DELETE')).toBe(true)
+
+    // The released lock allows a FRESH load-more (second parked request; the
+    // server still holds two done cards, so a deeper page exists).
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // Both responses land: the stale one (pre-mutation, old token) is
+    // discarded; the fresh one (current token) applies its page. The fresh
+    // request continues at the held offset (1) — its page is [d2], served
+    // from post-mutation server truth.
+    expect(server.releaseDeferred('done_offset')).toBe(2)
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
     h.unmount()
   })
 
