@@ -172,6 +172,11 @@ function createServer(extraTasks: any[] = []) {
   // DELETE ids that fail (partial-failure emulation for bulk delete).
   const deleteFailures = new Set<string>()
 
+  // Bulk/PATCH ids whose WRITE fails (failed-move restore emulation): the
+  // mutation does NOT apply server-side for these ids — done membership is
+  // kept — and the response reports ok:false (bulk) / rejects (PATCH).
+  const writeFailures = new Set<string>()
+
   const LIMIT = 1
 
   const doneSorted = () =>
@@ -239,6 +244,8 @@ function createServer(extraTasks: any[] = []) {
       const body = JSON.parse((opts && opts.body) || '{}')
 
       for (const id of body.ids || []) {
+        if (writeFailures.has(id)) { continue }
+
         const t = tasks.get(id)
 
         if (t && body.status) { t.status = body.status }
@@ -246,11 +253,17 @@ function createServer(extraTasks: any[] = []) {
         if (t && body.archive) { t.status = 'archived' }
       }
 
+      const result = (): any => ({
+        results: (body.ids || []).map((id: string) => writeFailures.has(id)
+          ? { id, ok: false, error: `write failed: ${id}` }
+          : { id, ok: true }),
+      })
+
       if (deferredWritesEnabled()) {
-        return new Promise((resolve) => { deferred.push({ url, payload: { results: (body.ids || []).map((id: string) => ({ id, ok: true })) }, resolve }) })
+        return new Promise((resolve) => { deferred.push({ url, payload: result(), resolve }) })
       }
 
-      return Promise.resolve({ results: (body.ids || []).map((id: string) => ({ id, ok: true })) })
+      return Promise.resolve(result())
     }
 
     const patchMatch = url.match(/\/tasks\/([^/?]+)/)
@@ -280,7 +293,11 @@ function createServer(extraTasks: any[] = []) {
     }
 
     if (patchMatch && opts && opts.method === 'PATCH') {
-      const t = tasks.get(decodeURIComponent(patchMatch[1]))
+      const id = decodeURIComponent(patchMatch[1])
+
+      if (writeFailures.has(id)) { return Promise.reject(new Error(`patch failed: ${id}`)) }
+
+      const t = tasks.get(id)
       const body = JSON.parse((opts && opts.body) || '{}')
 
       if (t && body.status) { t.status = body.status }
@@ -318,6 +335,9 @@ function createServer(extraTasks: any[] = []) {
     // window of the optimistic move paths.
     setDeferWrites(v: boolean) { deferWriteMode = v },
     setDeleteFailures(ids: string[]) { for (const id of ids) { deleteFailures.add(id) } },
+    // Marks bulk/PATCH ids whose WRITE fails (mutation not applied, ok:false /
+    // rejection) — drives the failed-move restore paths.
+    setWriteFailures(ids: string[]) { for (const id of ids) { writeFailures.add(id) } },
     releaseDeferred(filter: string): number {
       let n = 0
 
@@ -1180,6 +1200,119 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     await h.flush()
     expect(h.doneIds()).toEqual(['d1', 'd2'])
     expect(h.boardColumnsProps().doneLoading).toBe(false)
+    h.unmount()
+  })
+
+  it('a WS status event prunes a card already held in an extra page (no ghost)', async () => {
+    const server = createServer()
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // d2 is loaded into a held extra page.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // ANOTHER client moves d2 out of done server-side; the status event
+    // arrives over the real WS handler. The held extra page still carries
+    // the stale done copy — the event must prune it immediately (the
+    // debounced reload only replaces the first page, the merge would
+    // otherwise resurrect d2 as a ghost even before that reload lands).
+    const ws = h.wsInstances[0]
+
+    if (ws.onopen) { ws.onopen() }
+    server.setTaskStatus('d2', 'todo')
+
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'status' }], cursor: 2 }) })
+    await h.flush()
+
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a failed single move restores the extra-page card (no vanishing card)', async () => {
+    const server = createServer()
+    server.setWriteFailures(['d2'])
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Move d2 (extra-page card) to todo; the PATCH fails server-side — d2
+    // KEEPS its done membership. The dispatch-time prune removed it from
+    // the held extras; the failure path must put it back, or it vanishes
+    // from the column (it lives beyond the first server page).
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    // d2 is back in the merged done column (first page d1 + restored d2).
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    h.unmount()
+  })
+
+  it('a bulk move with a partial failure restores the failed extra-page card', async () => {
+    // d0 sits on the first page (newest completion); d1/d2 live deeper.
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    // Bulk-move d1 + d2 to todo; d1 succeeds, d2 fails. Server truth after:
+    // done = [d0, d2] — d2 is beyond the first page and only reachable via
+    // the restored extra page.
+    h.boardColumnsProps().toggleSelected('d1')
+    await h.flush()
+    h.boardColumnsProps().toggleSelected('d2', true)
+    await h.flush()
+    h.boardColumnsProps().onMoveSelected('todo')
+    await h.flush()
+
+    // d1 moved; the failed d2 is restored into the held extras and merged
+    // back behind the first-page card d0.
+    expect(h.doneIds()).toEqual(['d0', 'd2'])
+    expect(h.todoIds()).toEqual(expect.arrayContaining(['d1', 't1']))
+    const bulk = h.callsTo('/tasks/bulk')[0]
+    expect(bulk).toBeTruthy()
+    expect(JSON.parse(bulk!.opts.body).ids.sort()).toEqual(['d1', 'd2'])
+    h.unmount()
+  })
+
+  it('applyBulk with a partial failure restores the failed extra-page card too', async () => {
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    h.boardColumnsProps().toggleSelected('d1')
+    await h.flush()
+    h.boardColumnsProps().toggleSelected('d2', true)
+    await h.flush()
+    h.nodeWithProp('onApply').onApply({ status: 'todo' })
+    await h.flush()
+
+    // d1 moved; the failed d2 is restored into the held extras and merged
+    // back behind the first-page card d0.
+    expect(h.doneIds()).toEqual(['d0', 'd2'])
+    expect(h.todoIds()).toContain('d1')
     h.unmount()
   })
 })

@@ -146,6 +146,22 @@
     return pages.filter(function (tk) { return !(tk && tk.id && ids.has(tk.id)); });
   }
 
+  // Put task objects BACK into the held extra pages when a membership write
+  // FAILED for them: the dispatch-time prune removed them optimistically, but
+  // a failed write never moved the card server-side — it is still done, and
+  // (living beyond the first page) would vanish from the merged column until
+  // the next "Load more". Appends only ids not already held (the merge
+  // dedupes, but keeping the extras duplicate-free keeps paging math honest).
+  // Pure; tested.
+  function restoreExtraDoneTasks(extraPages, tasks) {
+    const pages = (extraPages || []).slice();
+    const held = new Set(pages.map(function (tk) { return tk && tk.id; }));
+    for (const tk of (tasks || [])) {
+      if (tk && tk.id && !held.has(tk.id)) { pages.push(tk); held.add(tk.id); }
+    }
+    return pages;
+  }
+
   // Optimistic move shared by all move paths (single move, bulk move, bulk
   // patch): removes the moved ids from every column and prepends them (with
   // the new status) to the destination column. Cards that only live in a
@@ -975,10 +991,28 @@
                 // debounced reload. Non-membership events (edited, comment,
                 // …) leave in-flight pagination alone.
                 let membershipChanged = false;
+                const membershipTaskIds = [];
                 for (const e of msg.events) {
-                  if (e && e.kind === "status") { membershipChanged = true; break; }
+                  if (e && e.kind === "status") {
+                    membershipChanged = true;
+                    if (e.task_id) membershipTaskIds.push(e.task_id);
+                  }
                 }
-                if (membershipChanged) invalidateDonePageFetches();
+                if (membershipChanged) {
+                  // The event also names the moved cards: drop them from the
+                  // held extra pages NOW. The debounced reload replaces only
+                  // the first page (`kanbanBoard`); a card that lived in an
+                  // extra page would otherwise be merged back into the done
+                  // column as a ghost. A card that ENTERED done comes back
+                  // through the fresh first page — its stale extra copy (old
+                  // status) must go for the same reason.
+                  if (membershipTaskIds.length) {
+                    setExtraDone(function (prev) {
+                      return pruneExtraDoneTasks(prev, new Set(membershipTaskIds));
+                    });
+                  }
+                  invalidateDonePageFetches();
+                }
                 // Stamp per-task signal so the TaskDrawer can reload itself.
                 setTaskEventTick(function (prev) {
                   const next = Object.assign({}, prev);
@@ -1073,6 +1107,22 @@
         doneWritesRef.current += 1;
         setBoardData(function (b) { return withOptimisticMove(b, selectedIds, newStatus, extraDone); });
         const ids = Array.from(selectedIds);
+        // Token captured AFTER the dispatch-time invalidation: the failed-write
+        // restore below must not fire if the scope changed while the write was
+        // in flight — the new scope's extraDone was cleared on purpose, and
+        // injecting this scope's cards there would bleed them across scopes.
+        const writeGateToken = donePageGateRef.current.current();
+        const dispatchedExtra = extraDone;
+        const restoreFailedExtras = function (failedIdSet) {
+          if (!failedIdSet || failedIdSet.size === 0) return;
+          if (!donePageGateRef.current.accepts(writeGateToken)) return;
+          const tasks = dispatchedExtra.filter(function (tk) {
+            return tk && tk.id && failedIdSet.has(tk.id);
+          });
+          if (tasks.length) {
+            setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
+          }
+        };
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1089,6 +1139,11 @@
           if (failed.length > 0) {
             setError(`Bulk move: ${failed.length} of ${res.results.length} failed`);
             setFailedIds(new Set(failed.map(function (f) { return f.id; })));
+            // Failed writes never left done server-side — put their cards
+            // back into the held extra pages they were pruned from at
+            // dispatch, or they vanish from the column despite their
+            // still-valid done membership.
+            restoreFailedExtras(new Set(failed.map(function (f) { return f.id; })));
           } else {
             setFailedIds(new Set());
           }
@@ -1098,6 +1153,9 @@
         }).catch(function (err) {
           setError(`Move failed: ${err.message || err}`);
           setFailedIds(new Set(selectedIds));
+          // Whole request failed: every selected card is still done
+          // server-side — restore all of them to the held extra pages.
+          restoreFailedExtras(selectedIds);
           loadBoard();
         }).finally(function () {
           // Post-commit invalidation: re-bump the gate (nothing can be in
@@ -1113,6 +1171,10 @@
       invalidateDonePageFetches();
       doneWritesRef.current += 1;
       setBoardData(function (b) { return withOptimisticMove(b, new Set([taskId]), newStatus, extraDone); });
+      // Same gate token as the bulk path: a failed PATCH restores the card
+      // into the held extras only while still in the dispatch scope.
+      const writeGateToken = donePageGateRef.current.current();
+      const dispatchedExtra = extraDone;
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -1123,6 +1185,17 @@
         setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
       }).catch(function (err) {
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
+        // The write failed: the card is still done server-side and may live
+        // beyond the first page — put it back into the held extra pages it
+        // was optimistically pruned from at dispatch.
+        if (donePageGateRef.current.accepts(writeGateToken)) {
+          const restoreTasks = dispatchedExtra.filter(function (tk) {
+            return tk && tk.id === taskId;
+          });
+          if (restoreTasks.length) {
+            setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, restoreTasks); });
+          }
+        }
         loadBoard();
       }).finally(function () {
         // Post-commit invalidation: re-bump the gate and release the loading
@@ -1332,6 +1405,23 @@
             setBoardData(function (b) { return withOptimisticMove(b, selectedIds, finalPatch.status, extraDone); });
           }
         }
+        // Same failed-write restore as performMoveTask: a failed id never left
+        // done server-side, so its card goes back into the held extra pages —
+        // only while still in the dispatch scope (gate token captured after
+        // the dispatch-time invalidation).
+        const writeGateToken = donePageGateRef.current.current();
+        const dispatchedExtra = extraDone;
+        const restoreFailedExtras = function (failedIdSet) {
+          if (!changesDoneMembership) return;
+          if (!failedIdSet || failedIdSet.size === 0) return;
+          if (!donePageGateRef.current.accepts(writeGateToken)) return;
+          const tasks = dispatchedExtra.filter(function (tk) {
+            return tk && tk.id && failedIdSet.has(tk.id);
+          });
+          if (tasks.length) {
+            setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
+          }
+        };
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1353,6 +1443,9 @@
                 `${failed.length} of ${res.results.length} failed: ` +
                 failed.slice(0, 3).map(function (f) { return `${f.id} (${f.error})`; }).join("; "));
               setFailedIds(new Set(failed.map(function (f) { return f.id; })));
+              // Failed ids kept their done membership server-side — restore
+              // their cards to the held extra pages.
+              restoreFailedExtras(new Set(failed.map(function (f) { return f.id; })));
             } else {
               setFailedIds(new Set());
             }
@@ -1363,6 +1456,9 @@
           .catch(function (e) {
             setError(String(e.message || e));
             setFailedIds(new Set(selectedIds));
+            // Whole request failed: every selected card kept its done
+            // membership server-side — restore all of them.
+            restoreFailedExtras(selectedIds);
             loadBoard();
           })
           .finally(function () {
@@ -5232,6 +5328,7 @@
       donePagingState: donePagingState,
       withMergedDoneColumn: withMergedDoneColumn,
       pruneExtraDoneTasks: pruneExtraDoneTasks,
+      restoreExtraDoneTasks: restoreExtraDoneTasks,
       withOptimisticMove: withOptimisticMove,
       createDonePageGate: createDonePageGate,
       // Real drawer component — the lifecycle harness drives it directly
