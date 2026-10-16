@@ -1013,6 +1013,16 @@
     // departure pulls it up), and the held extras' server coordinates are
     // then unknown: re-anchor at the fresh boundary (never skips a card).
     const firstPageDoneIdsRef = useRef(null);
+    // Membership events per task id, counted as they arrive over the WS
+    // tailer. The failed-write restore compares the count captured at
+    // dispatch with the count at restore time: a membership event for the
+    // SAME id inside the write window means the server's done membership
+    // for that card changed while the write was in flight (a foreign
+    // archive/completion — the WS handler already pruned the frozen extra
+    // copy), and restoring the frozen copy would resurrect a ghost. Events
+    // about OTHER ids must not suppress this restore — hence a per-id
+    // count, not a single "something changed" flag.
+    const doneMembershipEventsRef = useRef({});
 
     // Extra done pages are fetched per board/filter scope — drop them when
     // the scope changes so stale pages from another board or filter never
@@ -1215,7 +1225,14 @@
                 for (const e of msg.events) {
                   if (e && DONE_MEMBERSHIP_EVENT_KINDS.has(e.kind)) {
                     membershipChanged = true;
-                    if (e.task_id) membershipTaskIds.push(e.task_id);
+                    if (e.task_id) {
+                      membershipTaskIds.push(e.task_id);
+                      // Count per id — the failed-write restore reads this
+                      // to detect a membership change for a SPECIFIC id
+                      // inside its write window (see doneMembershipEventsRef).
+                      doneMembershipEventsRef.current[e.task_id] =
+                        (doneMembershipEventsRef.current[e.task_id] || 0) + 1;
+                    }
                   }
                 }
                 if (membershipChanged) {
@@ -1336,11 +1353,23 @@
         // done and would otherwise vanish until the next "Load more".
         const writeScopeGen = scopeGenRef.current.current();
         const dispatchedExtra = extraDone;
+        // Per-id membership-event counts at dispatch: the restore below
+        // skips ids whose done membership changed via WS while the write
+        // was in flight (see doneMembershipEventsRef).
+        const membershipCountAtDispatch = {};
+        for (const id of ids) {
+          membershipCountAtDispatch[id] = doneMembershipEventsRef.current[id] || 0;
+        }
         const restoreFailedExtras = function (failedIdSet) {
           if (!failedIdSet || failedIdSet.size === 0) return;
           if (!scopeGenRef.current.accepts(writeScopeGen)) return;
           const tasks = dispatchedExtra.filter(function (tk) {
-            return tk && tk.id && failedIdSet.has(tk.id);
+            if (!tk || !tk.id || !failedIdSet.has(tk.id)) return false;
+            // A membership event for THIS id inside the write window means
+            // the server's done membership changed under the frozen copy
+            // (e.g. a foreign archive) — the WS prune already removed it,
+            // restoring it would resurrect a ghost.
+            return (doneMembershipEventsRef.current[tk.id] || 0) === membershipCountAtDispatch[tk.id];
           });
           if (tasks.length) {
             setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
@@ -1403,6 +1432,12 @@
       // card into the held extras unless the scope itself changed.
       const writeScopeGen = scopeGenRef.current.current();
       const dispatchedExtra = extraDone;
+      // Membership-event count for THIS id at dispatch: a WS membership
+      // event for the same id inside the write window means the server's
+      // done membership changed under the frozen copy (foreign archive/
+      // completion) — the restore must not resurrect it (see
+      // doneMembershipEventsRef).
+      const membershipCountAtDispatch = doneMembershipEventsRef.current[taskId] || 0;
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -1415,8 +1450,12 @@
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         // The write failed: the card is still done server-side and may live
         // beyond the first page — put it back into the held extra pages it
-        // was optimistically pruned from at dispatch.
-        if (scopeGenRef.current.accepts(writeScopeGen)) {
+        // was optimistically pruned from at dispatch. Skipped when a WS
+        // membership event for this id arrived inside the write window: the
+        // server's done membership changed under the frozen copy and the WS
+        // prune already removed it (restoring would resurrect a ghost).
+        if (scopeGenRef.current.accepts(writeScopeGen)
+            && (doneMembershipEventsRef.current[taskId] || 0) === membershipCountAtDispatch) {
           const restoreTasks = dispatchedExtra.filter(function (tk) {
             return tk && tk.id === taskId;
           });
@@ -1643,12 +1682,24 @@
         // other mutations/WS events must not suppress the restore).
         const writeScopeGen = scopeGenRef.current.current();
         const dispatchedExtra = extraDone;
+        // Per-id membership-event counts at dispatch: the restore below
+        // skips ids whose done membership changed via WS while the write
+        // was in flight (see doneMembershipEventsRef).
+        const membershipCountAtDispatch = {};
+        for (const id of Array.from(selectedIds)) {
+          membershipCountAtDispatch[id] = doneMembershipEventsRef.current[id] || 0;
+        }
         const restoreFailedExtras = function (failedIdSet) {
           if (!changesDoneMembership) return;
           if (!failedIdSet || failedIdSet.size === 0) return;
           if (!scopeGenRef.current.accepts(writeScopeGen)) return;
           const tasks = dispatchedExtra.filter(function (tk) {
-            return tk && tk.id && failedIdSet.has(tk.id);
+            if (!tk || !tk.id || !failedIdSet.has(tk.id)) return false;
+            // A membership event for THIS id inside the write window means
+            // the server's done membership changed under the frozen copy
+            // (e.g. a foreign archive) — the WS prune already removed it,
+            // restoring it would resurrect a ghost.
+            return (doneMembershipEventsRef.current[tk.id] || 0) === membershipCountAtDispatch[tk.id];
           });
           if (tasks.length) {
             setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });

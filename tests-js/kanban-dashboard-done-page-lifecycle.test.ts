@@ -1576,6 +1576,91 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     h.unmount()
   })
 
+  it('a WS membership event for the SAME id inside the write window suppresses the restore (no ghost)', async () => {
+    // The failed-write restore hangs on the scope generation only: a
+    // membership event about a DIFFERENT card must not suppress it (test
+    // above). But an event about the SAME id means the server's done
+    // membership for THAT card changed while the write was in flight —
+    // the WS handler already pruned the frozen extra copy, and restoring
+    // it would resurrect a ghost.
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    server.setDeferWrites(true)
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    // Move d2 (extra-page card) to todo; the PATCH is parked and will fail.
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+
+    // While the write is in flight, a foreign archive of d2 arrives over
+    // the WS tailer (kind 'archived' — kanban_db.archive_task): the WS
+    // handler prunes d2 from the held extras. The write then fails — but
+    // d2's done membership changed server-side under the frozen copy, so
+    // the restore must NOT put it back.
+    const ws = h.wsInstances[0]
+
+    if (ws.onopen) { ws.onopen() }
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'archived' }], cursor: 2 }) })
+    await h.flush()
+
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    // No ghost: d2 was pruned by the WS event and the restore skipped it.
+    // d1 was never touched and stays held; d0 is the first page.
+    expect(h.doneIds()).toEqual(['d0', 'd1'])
+    h.unmount()
+  })
+
+  it('a WS membership event for a DIFFERENT id inside the write window does not suppress the restore', async () => {
+    // Negative case for the per-id membership window: the event names
+    // another HELD extra card (d1) — d2's restore must still fire.
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    server.setDeferWrites(true)
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+
+    // Membership event about d1 (foreign status change) mid-flight: d1 is
+    // pruned from the held extras by the WS handler — but d2's restore
+    // must not be suppressed by an event about a different id.
+    const ws = h.wsInstances[0]
+
+    if (ws.onopen) { ws.onopen() }
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd1', kind: 'status' }], cursor: 2 }) })
+    await h.flush()
+
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+
+    // d2 is restored after the failed write (d1's prune is the WS-prune
+    // path's own behavior — it returns via the fresh first page / next
+    // load-more, out of scope here).
+    expect(h.doneIds()).toEqual(expect.arrayContaining(['d0', 'd2']))
+    expect(h.doneIds()).not.toContain('d1')
+    h.unmount()
+  })
+
   it('a /board response built before a membership mutation is discarded when it lands after the mutation (no ghost in the first done page)', async () => {
     // Second open card so the pre-mutation read is a BULK write's refresh
     // (which exists on every code path — see bulk .then refresh); d0 is the
