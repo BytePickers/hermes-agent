@@ -3,7 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 // Drives the REAL kanban dashboard component (the plain-IIFE plugin bundle)
 // through a minimal dependency-aware React-hooks shim — the tests-js suite is
@@ -453,8 +453,13 @@ function walk(node: unknown, visit: (n: VNode) => void): void {
 // opts.ws: install a WebSocket stub and let buildWsUrl resolve — lets a test
 // drive the plugin's real ws.onmessage handler (captured instances are
 // returned via the mount handle).
-function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: ReturnType<typeof createServer>, calls: Array<{ url: string; opts: any }>, opts: { ws?: boolean } = {}) {
+// opts.deferFirstWsUrl: the FIRST buildWsUrl call returns a manually-resolvable
+// deferred (mount.releaseFirstWsUrl) — lets a test park a URL-build
+// continuation across a scope switch.
+function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: ReturnType<typeof createServer>, calls: Array<{ url: string; opts: any }>, opts: { ws?: boolean; deferFirstWsUrl?: boolean } = {}) {
   const wsInstances: Array<Record<string, any>> = []
+  const pendingWsUrls: Array<(url: string) => void> = []
+  let wsUrlCalls = 0
 
   if (opts.ws) {
     class FakeWebSocket {
@@ -496,7 +501,15 @@ function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: Re
       },
       // Never settles: no WebSocket loop in tests (unless opts.ws).
       buildWsUrl: opts.ws
-        ? () => Promise.resolve('ws://test/events')
+        ? () => {
+            wsUrlCalls += 1
+
+            if (opts.deferFirstWsUrl && wsUrlCalls === 1) {
+              return new Promise<string>((resolve) => { pendingWsUrls.push(resolve) })
+            }
+
+            return Promise.resolve('ws://test/events')
+          }
         : () => new Promise(() => {}),
     },
     __HERMES_PLUGINS__: {
@@ -519,19 +532,27 @@ function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: Re
 
   ;(globalThis as unknown as { window: unknown }).window = win
 
-  return { win, wsInstances }
+  return {
+    win,
+    wsInstances,
+    releaseFirstWsUrl: () => {
+      const resolvers = pendingWsUrls.splice(0)
+
+      for (const r of resolvers) { r('ws://test/events') }
+    },
+  }
 }
 
 function evalPlugin(): void {
   vm.runInThisContext(readFileSync(PLUGIN_PATH, 'utf8'), { filename: PLUGIN_PATH })
 }
 
-function mount(server: ReturnType<typeof createServer>, opts: { ws?: boolean } = {}) {
+function mount(server: ReturnType<typeof createServer>, opts: { ws?: boolean; deferFirstWsUrl?: boolean } = {}) {
   const runtime = createHooksRuntime()
   const registered: Array<[string, any]> = []
   const calls: Array<{ url: string; opts: any }> = []
 
-  const { win, wsInstances } = createWindow(runtime, server, calls, opts) as { win: Record<string, any>; wsInstances: Array<Record<string, any>> }
+  const { win, wsInstances, releaseFirstWsUrl } = createWindow(runtime, server, calls, opts) as { win: Record<string, any>; wsInstances: Array<Record<string, any>>; releaseFirstWsUrl: () => void }
   win.__HERMES_PLUGINS__ = {
     register: (name: string, page: any) => { registered.push([name, page]) },
   }
@@ -611,6 +632,7 @@ function mount(server: ReturnType<typeof createServer>, opts: { ws?: boolean } =
     todoIds,
     donePaging,
     wsInstances,
+    releaseFirstWsUrl,
     calls,
     callsTo,
   }
@@ -2455,6 +2477,108 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     await h.flush()
     expect(h.doneIds()).toEqual(['d1', 'd2'])
     h.unmount()
+  })
+
+  it('a stale onclose from the OLD scope\u2019s socket after a board switch must NOT schedule a second socket (per-run lifecycle token)', async () => {
+    // close() is asynchronous and the scope switch does not wait for it: the
+    // old socket's onclose can fire AFTER the socket effect re-ran for the
+    // new scope. The old shared wsClosedRef was reset to false by the new
+    // run, so the late onclose sailed past its guard and scheduled the OLD
+    // run's openWs — a duplicated socket generation with old parameters that
+    // overwrote wsRef (the current socket untracked at the next cleanup:
+    // leak, duplicate frames). Every continuation must be bound to the run
+    // that created it: the old run's token was closed by ITS cleanup and a
+    // newer run cannot un-close it.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    try {
+      const server = createServer()
+      const h = mount(server, { ws: true })
+      await h.flush()
+      expect(h.doneIds()).toEqual(['d1'])
+      const staleWs = h.wsInstances[h.wsInstances.length - 1]
+      expect(staleWs).toBeTruthy()
+
+      // Scope switch: the effect re-runs and opens the CURRENT socket.
+      h.nodeWithProp('onSwitch').onSwitch('board-b')
+      await h.flush()
+      const socketsBefore = h.wsInstances.length
+      expect(socketsBefore).toBeGreaterThanOrEqual(2)
+
+      // The old socket's close event lands AFTER the switch (asynchronous
+      // close). Its backoff reconnect timer must never fire a socket.
+      staleWs.onclose({ code: 1006 })
+      await vi.advanceTimersByTimeAsync(31_000)
+      await h.flush()
+      expect(h.wsInstances.length).toBe(socketsBefore)
+      h.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a parked buildWsUrl continuation of the OLD scope must NOT open a socket after a board switch (per-run lifecycle token)', async () => {
+    // The URL build is async (gated mode mints a ticket): its .then can
+    // resolve after the scope switched. The old continuation checked the
+    // shared, already-reset wsClosedRef and opened a second socket with the
+    // old board pinned — wsRef overwritten, duplicate generation. The
+    // continuation belongs to the run that started the build; that run was
+    // closed by its own cleanup.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    try {
+      const server = createServer()
+      const h = mount(server, { ws: true, deferFirstWsUrl: true })
+      await h.flush()
+      // The first URL build is parked: no socket yet.
+      expect(h.wsInstances.length).toBe(0)
+
+      // Scope switch: the new run's URL build resolves normally and opens
+      // the current socket; the old run's continuation stays parked.
+      h.nodeWithProp('onSwitch').onSwitch('board-b')
+      await h.flush()
+      const socketsBefore = h.wsInstances.length
+      expect(socketsBefore).toBeGreaterThanOrEqual(1)
+
+      // The parked URL build of the OLD run resolves now: it must open
+      // nothing.
+      h.releaseFirstWsUrl()
+      await vi.advanceTimersByTimeAsync(31_000)
+      await h.flush()
+      expect(h.wsInstances.length).toBe(socketsBefore)
+      h.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a legitimate reconnect after a connection drop WITHIN the same scope still reopens exactly one follow-up socket', async () => {
+    // Negative pin: the per-run token must not suppress the real reconnect
+    // path — a drop (non-1008 close) inside the current run schedules its
+    // own openWs, which opens exactly one follow-up socket in the SAME run.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    try {
+      const server = createServer([doneTask('d3', 50)])
+      const h = mount(server, { ws: true })
+      await h.flush()
+      expect(h.doneIds()).toEqual(['d1'])
+      expect(h.wsInstances.length).toBe(1)
+      const dropped = h.wsInstances[0]
+
+      // Connection drop in the same scope: backoff reconnect fires.
+      dropped.onclose({ code: 1006 })
+      await vi.advanceTimersByTimeAsync(31_000)
+      await h.flush()
+      expect(h.wsInstances.length).toBe(2)
+      const reconnected = h.wsInstances[1]
+      // The follow-up socket is live: it carries the message wiring of the
+      // same run (message handler installed).
+      expect(typeof reconnected.onmessage).toBe('function')
+      h.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('a drawer patch reported with a stale scope token must not prune the new board\u2019s extra pages (same-id collision)', async () => {
