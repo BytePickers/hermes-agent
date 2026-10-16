@@ -86,6 +86,55 @@
     return body || raw;
   }
 
+  // --- Done-column paging (pure helpers; exercised by tests-js) -------------
+  // The backend pages the done column (plugin_api.get_board serves one window
+  // per /board read and reports it as done_pagination {total, offset, limit}).
+  // The client holds deeper pages in `extraDone` state and merges them with
+  // the freshest first page on every render — the first page stays live via
+  // the normal board refresh, extra pages are history.
+
+  // Merge the first page with every extra loaded page: dedupe by task id and
+  // re-apply the server's done ordering (completed_at DESC NULLS LAST, then
+  // id DESC — see plugin_api.get_board). Pages can overlap when new tasks
+  // complete between fetches; dedupe keeps that harmless.
+  function mergeDoneTasks(firstPage, extraPages) {
+    const seen = new Set();
+    const out = [];
+    for (const tk of (firstPage || [])) {
+      if (tk && tk.id && !seen.has(tk.id)) { seen.add(tk.id); out.push(tk); }
+    }
+    for (const tk of (extraPages || [])) {
+      if (tk && tk.id && !seen.has(tk.id)) { seen.add(tk.id); out.push(tk); }
+    }
+    out.sort(function (a, b) {
+      const aOpen = a.completed_at == null, bOpen = b.completed_at == null;
+      if (aOpen !== bOpen) return aOpen ? 1 : -1;
+      if (!aOpen && a.completed_at !== b.completed_at) return b.completed_at - a.completed_at;
+      return a.id < b.id ? 1 : (a.id > b.id ? -1 : 0);
+    });
+    return out;
+  }
+
+  // Paging view for the done column: `total` is the server-side done count,
+  // `loaded` how many of those cards the client holds (capped at total), and
+  // `hasMore` whether a "load more" affordance should render.
+  function donePagingState(pagination, mergedDoneTasks) {
+    const total = (pagination && typeof pagination.total === "number") ? pagination.total : mergedDoneTasks.length;
+    const loaded = Math.min(total, mergedDoneTasks.length);
+    return { total: total, loaded: loaded, hasMore: loaded < total };
+  }
+
+  // Replace the done column's tasks in a board payload with the merged set,
+  // leaving every other column (and the payload shape) untouched.
+  function withMergedDoneColumn(board, extraDoneTasks) {
+    if (!board || !board.columns) return board;
+    const merged = board.columns.map(function (col) {
+      if (col.name !== "done") return col;
+      return Object.assign({}, col, { tasks: mergeDoneTasks(col.tasks, extraDoneTasks) });
+    });
+    return Object.assign({}, board, { columns: merged });
+  }
+
   // Board column display order; any backend status not listed here renders after these.
   const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
@@ -637,11 +686,20 @@
     // component had `const [board, setBoard]` for the grid data. We
     // renamed the grid data to `kanbanBoard` so the more useful name
     // (`board`) belongs to the selected slug.
-    const boardData = kanbanBoard;
     const setBoardData = setKanbanBoard;
     const [config, setConfig] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+
+    // Done-column paging: the server serves one window of the done column per
+    // /board read (done_pagination); `extraDone` holds the deeper pages the
+    // user loaded via "Load more". The alias below merges them so the rest of
+    // the component keeps seeing one complete done column.
+    const [extraDone, setExtraDone] = useState([]);
+    const [doneLoading, setDoneLoading] = useState(false);
+    const boardData = useMemo(function () {
+      return withMergedDoneColumn(kanbanBoard, extraDone);
+    }, [kanbanBoard, extraDone]);
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
@@ -701,6 +759,43 @@
         })
         .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived, board]);
+
+    // Extra done pages are fetched per board/filter scope — drop them when
+    // the scope changes so stale pages from another board or filter never
+    // bleed into the merged done column.
+    useEffect(function () {
+      setExtraDone([]);
+      setDoneLoading(false);
+    }, [board, tenantFilter, includeArchived]);
+
+    // Load the next page of the done column. The offset is how many done
+    // cards the client already holds (first page + extras); the server slices
+    // the same newest-completed-first ordering, so pages continue where the
+    // last one ended (small overlaps from concurrent completions are removed
+    // by the merge).
+    const loadMoreDone = useCallback(function () {
+      if (!kanbanBoard || doneLoading) return Promise.resolve();
+      const pagination = kanbanBoard.done_pagination || null;
+      const mergedNow = withMergedDoneColumn(kanbanBoard, extraDone).columns
+        .find(function (c) { return c.name === "done"; });
+      const paging = donePagingState(pagination, (mergedNow && mergedNow.tasks) || []);
+      if (!paging.hasMore) return Promise.resolve();
+      const qs = new URLSearchParams();
+      qs.set("done_offset", String(paging.loaded));
+      if (tenantFilter) qs.set("tenant", tenantFilter);
+      if (includeArchived) qs.set("include_archived", "true");
+      setDoneLoading(true);
+      return SDK.fetchJSON(withBoard(`${API}/board?${qs}`, board))
+        .then(function (data) {
+          const doneCol = ((data && data.columns) || []).find(function (c) { return c.name === "done"; });
+          const page = (doneCol && doneCol.tasks) || [];
+          setExtraDone(function (prev) { return prev.concat(page); });
+        })
+        .catch(function (err) {
+          setError(String(err && err.message ? err.message : err));
+        })
+        .finally(function () { setDoneLoading(false); });
+    }, [kanbanBoard, extraDone, doneLoading, tenantFilter, includeArchived, board]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -833,6 +928,13 @@
         }),
       });
     }, [boardData, tenantFilter, assigneeFilter, search]);
+
+    // Done-column paging view for the footer affordance (unfiltered, so the
+    // button stays truthful even while a search hides some loaded cards).
+    const donePaging = useMemo(function () {
+      const doneCol = ((boardData && boardData.columns) || []).find(function (c) { return c.name === "done"; });
+      return donePagingState(boardData && boardData.done_pagination, (doneCol && doneCol.tasks) || []);
+    }, [boardData]);
 
     // --- actions ------------------------------------------------------------
     // Performs the actual move (optimistic UI + PATCH) once any required
@@ -1357,6 +1459,9 @@
           onOpen: setSelectedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
+          donePaging: donePaging,
+          doneLoading: doneLoading,
+          onLoadMoreDone: loadMoreDone,
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
@@ -2937,6 +3042,9 @@
           onOpen: props.onOpen,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
+          donePaging: props.donePaging,
+          doneLoading: props.doneLoading,
+          onLoadMoreDone: props.onLoadMoreDone,
         });
       }),
       h(TrashDropZone, {
@@ -3090,6 +3198,23 @@
                 });
               }),
       ),
+      // Done column is server-paginated: offer to load the next page of
+      // completion history when the client holds fewer cards than exist.
+      props.column.name === "done" && props.donePaging && props.donePaging.hasMore && props.onLoadMoreDone
+        ? h("div", { className: "hermes-kanban-done-more" },
+            h("span", { className: "hermes-kanban-done-more-count" },
+              tx(t, "doneLoadedCount", "{loaded} of {total} loaded",
+                 { loaded: String(props.donePaging.loaded), total: String(props.donePaging.total) })),
+            h("button", {
+              type: "button",
+              className: "hermes-kanban-done-more-btn",
+              disabled: !!props.doneLoading,
+              onClick: function () { props.onLoadMoreDone(); },
+            }, props.doneLoading
+              ? tx(t, "doneLoadingMore", "Loading…")
+              : tx(t, "loadMoreDone", "Load more")),
+          )
+        : null,
     );
   }
 
@@ -4909,5 +5034,15 @@
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
     window.__HERMES_PLUGINS__.register("kanban", KanbanPage);
+  }
+
+  // Test seam (vitest, tests-js): exposes the pure done-paging helpers without
+  // changing runtime behavior — only present when the harness pre-sets the flag.
+  if (window.__HERMES_KANBAN_TEST__) {
+    window.__HERMES_KANBAN_TEST_HELPERS__ = {
+      mergeDoneTasks: mergeDoneTasks,
+      donePagingState: donePagingState,
+      withMergedDoneColumn: withMergedDoneColumn,
+    };
   }
 })();

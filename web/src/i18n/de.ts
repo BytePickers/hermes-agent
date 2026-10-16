@@ -757,6 +757,9 @@ export const de: Translations = {
       done: "Abgeschlossen",
       archived: "Archiviert",
     },
+    loadMoreDone: "Mehr laden",
+    doneLoadingMore: "Lädt…",
+    doneLoadedCount: "{loaded} von {total} geladen",
     confirmDone:
       "Diese Aufgabe als erledigt markieren? Der Anspruch des Workers wird freigegeben und abhängige untergeordnete Aufgaben werden bereit.",
     confirmArchive:
