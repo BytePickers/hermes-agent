@@ -65,6 +65,13 @@ describe('kanban dashboard done-column paging', () => {
     mergeDoneTasks: (first: unknown, extra: unknown) => Array<{ id: string; completed_at: number | null }>
     donePagingState: (pagination: unknown, merged: unknown[]) => { total: number; loaded: number; hasMore: boolean }
     withMergedDoneColumn: (board: unknown, extra: unknown[]) => { columns: Array<{ name: string; tasks: Array<{ id: string }> }> } & Record<string, unknown>
+    pruneExtraDoneTasks: (extra: unknown, ids: Set<string>) => Array<{ id: string }>
+    withOptimisticMove: (board: any, ids: Set<string>, newStatus: string, extraDone: any[]) => any
+    createDonePageGate: () => {
+      current: () => number
+      reset: () => number
+      accepts: (token: number) => boolean
+    }
   }
 
   it('registers the kanban page against the plugin host', () => {
@@ -123,5 +130,90 @@ describe('kanban dashboard done-column paging', () => {
     expect(board.columns.find((c) => c.name === 'done')!.tasks).toHaveLength(1)
     // Null/shapeless payloads pass through.
     expect(helpers.withMergedDoneColumn(null, [])).toBeNull()
+  })
+
+  it('pruneExtraDoneTasks drops moved ids from the held extra pages and keeps the rest', () => {
+    const extra = [task('d2', 400), task('d3', 300), task('d4', 200)]
+    // Single move: only that id leaves the extras.
+    expect(helpers.pruneExtraDoneTasks(extra, new Set(['d3'])).map((t) => t.id))
+      .toEqual(['d2', 'd4'])
+    // Bulk move: every moved id leaves, order of the survivors is kept.
+    expect(helpers.pruneExtraDoneTasks(extra, new Set(['d2', 'd4'])).map((t) => t.id))
+      .toEqual(['d3'])
+    // Ids that are not held are a no-op; empty/missing id sets never mutate.
+    expect(helpers.pruneExtraDoneTasks(extra, new Set(['nope']))).toEqual(extra)
+    expect(helpers.pruneExtraDoneTasks(extra, new Set())).toEqual(extra)
+    expect(helpers.pruneExtraDoneTasks(null, new Set(['d1']))).toEqual([])
+    // Entries without an id survive (defensive: merge ignores them too).
+    expect(helpers.pruneExtraDoneTasks([{ noId: true } as { id?: string }], new Set(['d1'])))
+      .toEqual([{ noId: true }])
+  })
+
+  it('withOptimisticMove moves raw-column and extra-page cards into the destination', () => {
+    const openTaskShape = (id: string) => ({ id, status: 'todo', title: id, completed_at: null })
+
+    const board = {
+      columns: [
+        { name: 'todo', tasks: [openTaskShape('t1')] },
+        { name: 'done', tasks: [task('d1', 300)] },
+      ],
+    }
+
+    const extra = [task('d2', 200)]
+
+    // Bulk: both a raw-column card (d1) and an extra-page-only card (d2).
+    const moved = helpers.withOptimisticMove(board, new Set(['d1', 'd2']), 'todo', extra)
+    const col = (name: string) => moved.columns.find((c: any) => c.name === name)
+    expect(col('done').tasks.map((t: any) => t.id)).toEqual([])
+    expect(col('todo').tasks.map((t: any) => t.id)).toEqual(['d1', 'd2', 't1']) // prepended
+    expect(col('todo').tasks.map((t: any) => t.status)).toEqual(['todo', 'todo', 'todo'])
+    // Original board untouched.
+    expect(board.columns.find((c: any) => c.name === 'done')!.tasks).toHaveLength(1)
+
+    // Single id that lives only in the extras lands in the destination too.
+    const single = helpers.withOptimisticMove(board, new Set(['d2']), 'todo', extra)
+    expect(single.columns.find((c: any) => c.name === 'done')!.tasks.map((t: any) => t.id)).toEqual(['d1'])
+    expect(single.columns.find((c: any) => c.name === 'todo')!.tasks.map((t: any) => t.id)).toEqual(['d2', 't1'])
+
+    // Missing destination column is a no-op on the payload (still prunes).
+    const noDest = helpers.withOptimisticMove(
+      { columns: [{ name: 'done', tasks: [task('d1', 300)] }] },
+      new Set(['d1']), 'archive', [],
+    )
+
+    expect(noDest.columns.find((c: any) => c.name === 'done')!.tasks).toEqual([])
+
+    // Shapeless payloads pass through; no ids → no change.
+    expect(helpers.withOptimisticMove(null, new Set(['d1']), 'todo', [])).toBeNull()
+    const unchanged = helpers.withOptimisticMove(board, new Set(), 'todo', extra)
+    expect(unchanged.columns.find((c: any) => c.name === 'done')!.tasks).toHaveLength(1)
+  })
+
+  it('done page gate discards responses that land after a scope reset (race)', () => {
+    const gate = helpers.createDonePageGate()
+
+    // Request starts under generation 0 and resolves before any switch — applied.
+    const freshToken = gate.current()
+    expect(gate.accepts(freshToken)).toBe(true)
+
+    // Scope switch (board / tenant / archived filter) resets the gate: every
+    // request that was in flight at reset time must be rejected, including
+    // one that started before an earlier reset.
+    const staleEarly = gate.current()
+    expect(gate.reset()).toBe(1)
+    const staleLate = gate.current()
+    expect(gate.reset()).toBe(2)
+
+    expect(gate.accepts(staleEarly)).toBe(false)
+    expect(gate.accepts(staleLate)).toBe(false)
+
+    // A request made AFTER the reset belongs to the current scope — applied.
+    const currentToken = gate.current()
+    expect(gate.accepts(currentToken)).toBe(true)
+
+    // The next switch invalidates only the requests outstanding at that time.
+    expect(gate.reset()).toBe(3)
+    expect(gate.accepts(currentToken)).toBe(false)
+    expect(gate.accepts(staleEarly)).toBe(false)
   })
 })

@@ -135,6 +135,64 @@
     return Object.assign({}, board, { columns: merged });
   }
 
+  // Drop task ids that left the board (move, bulk move, delete) from the
+  // held extra pages. The optimistic board update only rewrites the first
+  // page (`kanbanBoard`); a card that lived only in a loaded page would
+  // otherwise survive the move in `extraDone` and be resurrected into the
+  // done column by the merge — a ghost card until the next scope switch.
+  function pruneExtraDoneTasks(extraPages, ids) {
+    const pages = extraPages || [];
+    if (!ids || typeof ids.has !== "function" || ids.size === 0) return pages;
+    return pages.filter(function (tk) { return !(tk && tk.id && ids.has(tk.id)); });
+  }
+
+  // Optimistic move shared by all move paths (single move, bulk move, bulk
+  // patch): removes the moved ids from every column and prepends them (with
+  // the new status) to the destination column. Cards that only live in a
+  // loaded extra done page are invisible to the raw columns, so they are
+  // pulled from `extraDoneTasks` — paired with pruneExtraDoneTasks this
+  // keeps them out of the done merge AND lands them in the destination
+  // immediately, before the server refresh arrives. Pure; tested.
+  function withOptimisticMove(board, ids, newStatus, extraDoneTasks) {
+    if (!board || !board.columns) return board;
+    const idSet = ids || new Set();
+    const moved = [];
+    const columns = board.columns.map(function (col) {
+      const kept = [];
+      for (const tk of col.tasks) {
+        if (tk && idSet.has(tk.id)) moved.push(Object.assign({}, tk, { status: newStatus }));
+        else kept.push(tk);
+      }
+      return Object.assign({}, col, { tasks: kept });
+    });
+    if (extraDoneTasks && extraDoneTasks.length) {
+      for (const tk of extraDoneTasks) {
+        if (tk && tk.id && idSet.has(tk.id) && !moved.some(function (m) { return m.id === tk.id; })) {
+          moved.push(Object.assign({}, tk, { status: newStatus }));
+        }
+      }
+    }
+    const dest = columns.find(function (c) { return c.name === newStatus; });
+    if (dest && moved.length) dest.tasks = moved.concat(dest.tasks);
+    return Object.assign({}, board, { columns });
+  }
+
+  // Generation gate for in-flight "Load more" requests. Each board/filter
+  // scope switch resets the gate; a response fetched before the reset must
+  // never be applied — otherwise the old scope's page (potentially another
+  // tenant's) hangs on the new scope's freshly-cleared extra pages. Pure
+  // state machine so the race decision is testable without React.
+  function createDonePageGate() {
+    let generation = 0;
+    return {
+      current: function () { return generation; },
+      // Invalidate every outstanding request token (scope changed).
+      reset: function () { generation += 1; return generation; },
+      // May a response fetched under `token` still be applied?
+      accepts: function (token) { return token === generation; },
+    };
+  }
+
   // Board column display order; any backend status not listed here renders after these.
   const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
@@ -697,6 +755,10 @@
     // the component keeps seeing one complete done column.
     const [extraDone, setExtraDone] = useState([]);
     const [doneLoading, setDoneLoading] = useState(false);
+    // In-flight "Load more" requests are token-gated: a page fetched before
+    // a scope switch must not be applied to the new scope (see gate below).
+    const donePageGateRef = useRef(null);
+    if (!donePageGateRef.current) donePageGateRef.current = createDonePageGate();
     const boardData = useMemo(function () {
       return withMergedDoneColumn(kanbanBoard, extraDone);
     }, [kanbanBoard, extraDone]);
@@ -762,8 +824,10 @@
 
     // Extra done pages are fetched per board/filter scope — drop them when
     // the scope changes so stale pages from another board or filter never
-    // bleed into the merged done column.
+    // bleed into the merged done column. The gate bump also invalidates any
+    // in-flight "Load more" response from the old scope.
     useEffect(function () {
+      donePageGateRef.current.reset();
       setExtraDone([]);
       setDoneLoading(false);
     }, [board, tenantFilter, includeArchived]);
@@ -780,6 +844,9 @@
         .find(function (c) { return c.name === "done"; });
       const paging = donePagingState(pagination, (mergedNow && mergedNow.tasks) || []);
       if (!paging.hasMore) return Promise.resolve();
+      // Token for this request; the reset effect bumps the gate on every
+      // scope change, so a response that lands after a switch is discarded.
+      const token = donePageGateRef.current.current();
       const qs = new URLSearchParams();
       qs.set("done_offset", String(paging.loaded));
       if (tenantFilter) qs.set("tenant", tenantFilter);
@@ -787,11 +854,13 @@
       setDoneLoading(true);
       return SDK.fetchJSON(withBoard(`${API}/board?${qs}`, board))
         .then(function (data) {
+          if (!donePageGateRef.current.accepts(token)) return;  // stale scope — discard
           const doneCol = ((data && data.columns) || []).find(function (c) { return c.name === "done"; });
           const page = (doneCol && doneCol.tasks) || [];
           setExtraDone(function (prev) { return prev.concat(page); });
         })
         .catch(function (err) {
+          if (!donePageGateRef.current.accepts(token)) return;  // stale scope — no banner
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setDoneLoading(false); });
@@ -953,21 +1022,10 @@
         : patch;
       if (count > 1) {
         // Bulk path: optimistic UI prepends all moved tasks to dest column.
-        setBoardData(function (b) {
-          if (!b) return b;
-          const moved = [];
-          const columns = b.columns.map(function (col) {
-            const kept = [];
-            for (const tk of col.tasks) {
-              if (selectedIds.has(tk.id)) moved.push(Object.assign({}, tk, { status: newStatus }));
-              else kept.push(tk);
-            }
-            return Object.assign({}, col, { tasks: kept });
-          });
-          const dest = columns.find(function (c) { return c.name === newStatus; });
-          if (dest) dest.tasks = moved.concat(dest.tasks);
-          return Object.assign({}, b, { columns });
-        });
+        // Cards that lived only in a loaded done page must also leave the
+        // held extras, or the merge resurrects them as ghosts.
+        setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, selectedIds); });
+        setBoardData(function (b) { return withOptimisticMove(b, selectedIds, newStatus, extraDone); });
         const ids = Array.from(selectedIds);
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
           method: "POST",
@@ -992,22 +1050,8 @@
         return;
       }
       // Single-task path.
-      setBoardData(function (b) {
-        if (!b) return b;
-        let moved = null;
-        const columns = b.columns.map(function (col) {
-          const next = col.tasks.filter(function (tk) {
-            if (tk.id === taskId) { moved = Object.assign({}, tk, { status: newStatus }); return false; }
-            return true;
-          });
-          return Object.assign({}, col, { tasks: next });
-        });
-        if (moved) {
-          const dest = columns.find(function (c) { return c.name === newStatus; });
-          if (dest) dest.tasks = [moved].concat(dest.tasks);
-        }
-        return Object.assign({}, b, { columns });
-      });
+      setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+      setBoardData(function (b) { return withOptimisticMove(b, new Set([taskId]), newStatus, extraDone); });
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -1016,7 +1060,7 @@
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         loadBoard();
       });
-    }, [loadBoard, board, t, selectedIds]);
+    }, [loadBoard, board, t, selectedIds, extraDone]);
 
     // Pre-dispatch dialog step for both moveTask and moveSelected. Drives
     // the new in-app ConfirmDialog instead of window.confirm. The flow:
@@ -1205,21 +1249,10 @@
         const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
         // Optimistic UI for status moves (same pattern as moveSelected).
         if (finalPatch.status) {
-          setBoardData(function (b) {
-            if (!b) return b;
-            const moved = [];
-            const columns = b.columns.map(function (col) {
-              const kept = [];
-              for (const t of col.tasks) {
-                if (selectedIds.has(t.id)) moved.push(Object.assign({}, t, { status: finalPatch.status }));
-                else kept.push(t);
-              }
-              return Object.assign({}, col, { tasks: kept });
-            });
-            const dest = columns.find(function (c) { return c.name === finalPatch.status; });
-            if (dest) dest.tasks = moved.concat(dest.tasks);
-            return Object.assign({}, b, { columns });
-          });
+          // Same ghost-card guard as performMoveTask: moved cards must also
+          // leave the held extra done pages.
+          setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, selectedIds); });
+          setBoardData(function (b) { return withOptimisticMove(b, selectedIds, finalPatch.status, extraDone); });
         }
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
           method: "POST",
@@ -1259,7 +1292,7 @@
       }).then(function (r) {
         if (r.confirmed) run();
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, loadBoard, board, t, kanbanDialogs]);
+    }, [selectedIds, loadBoard, board, t, kanbanDialogs, extraDone]);
 
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
@@ -1325,11 +1358,14 @@
        confirmLabel: tx(t, "common.delete", "Delete"),
        destructive: true,
      }).then(function (r) {
-       if (!r.confirmed) return null;
-       return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
-         method: "DELETE",
-       }).then(function () {
-         loadBoard();
+      if (!r.confirmed) return null;
+      return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
+        method: "DELETE",
+      }).then(function () {
+        // Deleted cards must also leave the held extra done pages, or the
+        // merge resurrects them (same ghost-card class as moves).
+        setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+        loadBoard();
          setSelectedIds(function (prev) {
            const next = new Set(prev);
            next.delete(taskId);
@@ -1354,6 +1390,9 @@
         return Promise.all(ids.map(function (id) {
           return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
         })).then(function () {
+          // Deleted cards must also leave the held extra done pages (ghost
+          // guard, same as performMoveTask).
+          setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(ids)); });
           loadBoard();
         }).catch(function (e) { setError(String(e.message || e)); });
       }).catch(function () { /* cancelled */ });
@@ -5043,6 +5082,9 @@
       mergeDoneTasks: mergeDoneTasks,
       donePagingState: donePagingState,
       withMergedDoneColumn: withMergedDoneColumn,
+      pruneExtraDoneTasks: pruneExtraDoneTasks,
+      withOptimisticMove: withOptimisticMove,
+      createDonePageGate: createDonePageGate,
     };
   }
 })();
