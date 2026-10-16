@@ -1868,7 +1868,7 @@
        destructive: true,
      }).then(function (r) {
       if (!r.confirmed) return null;
-      return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
+      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "DELETE",
       }).then(function () {
         // Count the successful delete per id (see doneDeletesRef): the
@@ -1909,7 +1909,7 @@
         // clear them). Settle every delete, prune the successes, refresh,
         // and surface the failures.
         return Promise.allSettled(ids.map(function (id) {
-          return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+          return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(id)}`, board), { method: "DELETE" });
         })).then(function (results) {
           const deletedIds = [];
           const failed = [];

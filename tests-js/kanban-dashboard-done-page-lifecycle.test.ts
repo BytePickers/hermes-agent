@@ -1139,6 +1139,49 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     h.unmount()
   })
 
+  it('single delete rides the board param: the DELETE URL carries the current board slug', async () => {
+    // plugin_api.delete_task resolves a MISSING board param to the ACTIVE
+    // board (its own DB file per board). A delete fired without ?board=
+    // would hit the default board's DB — the wrong card at an id collision,
+    // else a 404 — whenever the dashboard's tab is not the active board.
+    const server = createServer()
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onDelete('d1')
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+
+    const del = h.callsTo('/tasks/d1').find((c) => (c.opts && c.opts.method) === 'DELETE')
+    expect(del).toBeTruthy()
+    expect(new URLSearchParams((del!.url.split('?')[1]) || '').get('board')).toBe('default')
+    h.unmount()
+  })
+
+  it('bulk delete rides the board param too: every DELETE URL carries the current board slug', async () => {
+    const server = createServer()
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().toggleSelected('d1')
+    await h.flush()
+    h.boardColumnsProps().toggleSelected('d2', true)
+    await h.flush()
+    h.nodeWithProp('onDelete').onDelete(2)
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+
+    for (const id of ['d1', 'd2']) {
+      const del = h.callsTo(`/tasks/${id}`).find((c) => (c.opts && c.opts.method) === 'DELETE')
+      expect(del).toBeTruthy()
+      expect(new URLSearchParams((del!.url.split('?')[1]) || '').get('board')).toBe('default')
+    }
+
+    h.unmount()
+  })
+
   it('a stale load-more must not release the new scope\u2019s loading lock (no double fetch)', async () => {
     const server = createServer()
     server.setDeferLoadMore(true)
