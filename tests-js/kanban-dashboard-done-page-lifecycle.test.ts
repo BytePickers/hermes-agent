@@ -238,7 +238,16 @@ function createServer(extraTasks: any[] = []) {
       return new Promise((resolve) => { deferred.push({ url, payload, resolve }) })
     }
 
-    if (url.includes('/board')) { return Promise.resolve(serveBoard(0)) }
+    if (url.includes('/board')) {
+      // First-page reads can be deferred too: the response is built at REQUEST
+      // time (pre-mutation server truth) and released by the test later —
+      // pins down the stale-/board-read race.
+      const payload = serveBoard(0)
+
+      if (!boardReadDeferEnabled()) { return Promise.resolve(payload) }
+
+      return new Promise((resolve) => { deferred.push({ url, payload, resolve }) })
+    }
 
     if (url.includes('/tasks/bulk')) {
       const body = JSON.parse((opts && opts.body) || '{}')
@@ -295,7 +304,18 @@ function createServer(extraTasks: any[] = []) {
     if (patchMatch && opts && opts.method === 'PATCH') {
       const id = decodeURIComponent(patchMatch[1])
 
-      if (writeFailures.has(id)) { return Promise.reject(new Error(`patch failed: ${id}`)) }
+      if (writeFailures.has(id)) {
+        // A failing write can be PARKED too: the test holds the rejection in
+        // flight so a WS event can land inside the write window (the restore
+        // guard race — a same-scope gate reset between dispatch and failure).
+        if (deferredWritesEnabled()) {
+          return new Promise((_resolve, reject) => {
+            deferred.push({ url, payload: null, resolve: () => { reject(new Error(`patch failed: ${id}`)) } })
+          })
+        }
+
+        return Promise.reject(new Error(`patch failed: ${id}`))
+      }
 
       const t = tasks.get(id)
       const body = JSON.parse((opts && opts.body) || '{}')
@@ -326,6 +346,8 @@ function createServer(extraTasks: any[] = []) {
   const deferredEnabled = () => deferMode
   let deferWriteMode = false
   const deferredWritesEnabled = () => deferWriteMode
+  let deferBoardReadMode = false
+  const boardReadDeferEnabled = () => deferBoardReadMode
 
   return {
     route,
@@ -334,6 +356,9 @@ function createServer(extraTasks: any[] = []) {
     // the test holds a membership write in flight to pin down the pre-commit
     // window of the optimistic move paths.
     setDeferWrites(v: boolean) { deferWriteMode = v },
+    // Parks FIRST-PAGE /board reads (built at request time): the test holds a
+    // read in flight across a membership mutation — the stale-overwrite race.
+    setDeferBoardReads(v: boolean) { deferBoardReadMode = v },
     setDeleteFailures(ids: string[]) { for (const id of ids) { deleteFailures.add(id) } },
     // Marks bulk/PATCH ids whose WRITE fails (mutation not applied, ok:false /
     // rejection) — drives the failed-move restore paths.
@@ -840,7 +865,9 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     server.releaseDeferred('done_offset')
     await h.flush()
     expect(h.doneIds()).toEqual(['d1'])
-    expect(h.todoIds()).toEqual(['t1'])
+    // The post-commit refresh (fresh read under the new generation) shows
+    // server truth: d2 legitimately sits in todo after the successful move.
+    expect(h.todoIds()).toEqual(['t1', 'd2'])
     h.unmount()
   })
 
@@ -1054,38 +1081,44 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
   })
 
   it('load-more is blocked while a move write is in flight; usable again after it settles', async () => {
-    const server = createServer()
+    // Seed cards d0 (first page) and d3 (deepest): after the held extra-page
+    // card d1 moves out, done still spans two pages (d0, d2, d3), so the
+    // post-settle load-more has something to fetch.
+    const server = createServer([doneTask('d0', 400), doneTask('d3', 100)])
     server.setDeferWrites(true)
     const h = mount(server)
     await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
 
     h.boardColumnsProps().onLoadMoreDone()
     await h.flush()
-    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    expect(h.doneIds()).toEqual(['d0', 'd1'])
 
-    // Move d2 out of done — the PATCH write is parked, so the component sits
-    // in the pre-commit window: dispatch-time prune+invalidation happened,
-    // but the server still holds d2 in done at the OLD done_pagination total.
-    h.boardColumnsProps().onMove('d2', 'todo')
+    // Move d1 (held extra-page card) out of done — the PATCH write is parked,
+    // so the component sits in the pre-commit window: dispatch-time
+    // prune+invalidation happened, but the server still holds d1 in done at
+    // the OLD done_pagination total.
+    h.boardColumnsProps().onMove('d1', 'todo')
     await h.flush()
     const offsetCallsBefore = h.callsTo('done_offset').length
 
     // A "Load more" dispatched inside the window must be a no-op — its page
-    // would be built from pre-write server state and ghost d2 back in.
+    // would be built from pre-write server state and ghost d1 back in.
     h.boardColumnsProps().onLoadMoreDone()
     await h.flush()
     expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore)
-    expect(h.doneIds()).toEqual(['d1'])
+    expect(h.doneIds()).toEqual(['d0'])
 
     // The write settles: pagination unblocks (post-commit invalidation) and
     // a fresh load-more is served from post-move server truth — no ghost.
-    server.releaseDeferred('/tasks/d2')
+    server.releaseDeferred('/tasks/d1')
     await h.flush()
     h.boardColumnsProps().onLoadMoreDone()
     await h.flush()
     expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore + 1)
-    expect(h.doneIds()).toEqual(['d1'])
-    expect(h.todoIds()).toContain('d2')
+    // Fresh page from post-move truth: done = [d0, d2] (d1 is in todo).
+    expect(h.doneIds()).toEqual(['d0', 'd2'])
+    expect(h.todoIds()).toContain('d1')
     h.unmount()
   })
 
@@ -1403,6 +1436,94 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     // back behind the first-page card d0.
     expect(h.doneIds()).toEqual(['d0', 'd2'])
     expect(h.todoIds()).toContain('d1')
+    h.unmount()
+  })
+
+  it('a failed membership write restores the extra-page card even when a foreign-card WS event resets the page gate mid-flight', async () => {
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    // Park the failing PATCH so the WS event can land INSIDE the write
+    // window (dispatch → write settles) — the honest shape of the race.
+    server.setDeferWrites(true)
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    // Move d2 (extra-page card) to todo; the PATCH is parked and will fail
+    // server-side — d2 KEEPS its done membership.
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+
+    // While the write is in flight, a WS membership event about a FOREIGN
+    // card (t1) resets the page gate — same scope. The restore must still
+    // fire when the write then fails: guarding it with the page-gate token
+    // would suppress it (every membership mutation and WS event bumps that
+    // gate) and d2 would vanish from the column until the next "Load more".
+    const ws = h.wsInstances[0]
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 't1', kind: 'status' }], cursor: 2 }) })
+    await h.flush()
+
+    // The write fails now — the restore must put d2 back into the extras.
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    // d2 is back in the merged done column (first page d0 + held extras:
+    // d1 was never touched, d2 restored after the failed write).
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+    h.unmount()
+  })
+
+  it('a /board response built before a membership mutation is discarded when it lands after the mutation (no ghost in the first done page)', async () => {
+    // Second open card so the pre-mutation read is a BULK write's refresh
+    // (which exists on every code path — see bulk .then refresh); d0 is the
+    // first-page done card that the membership mutation moves out.
+    const server = createServer([doneTask('d0', 400), openTask('t2')])
+    server.setDeferBoardReads(true)
+    const h = mount(server)
+    await h.flush()
+    // Mount issues TWO reads: one before the board slug resolves from the
+    // boards list (no ?board= param) and one after — the scope effect bumps
+    // the gate between them, so the first is invalidated on purpose. Release
+    // both; the second (current generation) renders the board.
+    expect(server.releaseDeferred('/board')).toBe(2)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    // A /board read starts and parks (built from current truth: done [d0],
+    // t1/t2 in todo): the refresh of a NON-membership bulk write (t1+t2 →
+    // ready) dispatches loadBoard like every write completion.
+    h.boardColumnsProps().toggleSelected('t1')
+    await h.flush()
+    h.boardColumnsProps().toggleSelected('t2', true)
+    await h.flush()
+    h.boardColumnsProps().onMoveSelected('ready')
+    await h.flush()
+
+    // Membership mutation while that read is still in flight: d0 leaves done.
+    h.boardColumnsProps().onMove('d0', 'todo')
+    await h.flush()
+
+    // The pre-mutation response lands first (FIFO) — it must be DISCARDED:
+    // applying it would overwrite the post-mutation board with pre-mutation
+    // server state (d0 back in the first done page as a ghost).
+    expect(server.releaseFirstDeferred()).toBe(1)
+    await h.flush()
+    expect(h.doneIds()).toEqual([])
+    expect(h.todoIds()).toContain('d0')
+
+    // The fresh post-mutation read applies: done = [d1] (server truth).
+    expect(server.releaseDeferred('/board')).toBe(1)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    expect(h.todoIds()).toEqual(['d0'])
     h.unmount()
   })
 })

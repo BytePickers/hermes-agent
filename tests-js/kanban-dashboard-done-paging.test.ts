@@ -67,9 +67,14 @@ describe('kanban dashboard done-column paging', () => {
     withMergedDoneColumn: (board: unknown, extra: unknown[]) => { columns: Array<{ name: string; tasks: Array<{ id: string }> }> } & Record<string, unknown>
     pruneExtraDoneTasks: (extra: unknown, ids: Set<string>) => Array<{ id: string }>
     withOptimisticMove: (board: any, ids: Set<string>, newStatus: string, extraDone: any[]) => any
-    createDonePageGate: () => {
+    createFetchGate: () => {
       current: () => number
       reset: () => number
+      accepts: (token: number) => boolean
+    }
+    createScopeGeneration: () => {
+      current: () => number
+      bump: () => number
       accepts: (token: number) => boolean
     }
   }
@@ -190,7 +195,7 @@ describe('kanban dashboard done-column paging', () => {
   })
 
   it('done page gate discards responses that land after a scope reset (race)', () => {
-    const gate = helpers.createDonePageGate()
+    const gate = helpers.createFetchGate()
 
     // Request starts under generation 0 and resolves before any switch — applied.
     const freshToken = gate.current()
@@ -215,5 +220,26 @@ describe('kanban dashboard done-column paging', () => {
     expect(gate.reset()).toBe(3)
     expect(gate.accepts(currentToken)).toBe(false)
     expect(gate.accepts(staleEarly)).toBe(false)
+  })
+
+  it('scope generation only moves on explicit bumps (restore guard semantics)', () => {
+    const scope = helpers.createScopeGeneration()
+
+    // A failed-write restore captured now stays valid — unlike the fetch
+    // gate, NOTHING bumps the scope generation implicitly: same-scope
+    // membership mutations and WS events about other cards must not suppress
+    // the restore (the card is still done and would otherwise vanish).
+    const writeScope = scope.current()
+    expect(scope.accepts(writeScope)).toBe(true)
+
+    // Only a real scope switch (board / tenant / archive filter) bumps it.
+    scope.bump()
+    expect(scope.accepts(writeScope)).toBe(false)
+
+    // A restore captured under the new scope is valid again.
+    const nextScope = scope.current()
+    expect(scope.accepts(nextScope)).toBe(true)
+    expect(scope.bump()).toBe(2)
+    expect(scope.accepts(nextScope)).toBe(false)
   })
 })
