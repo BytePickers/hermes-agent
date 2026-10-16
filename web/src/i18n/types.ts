@@ -862,6 +862,9 @@ export interface Translations {
       done: string;
       archived: string;
     };
+    loadMoreDone: string;
+    doneLoadingMore: string;
+    doneLoadedCount: string;
     confirmDone: string;
     confirmArchive: string;
     confirmBlocked: string;

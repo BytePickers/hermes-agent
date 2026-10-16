@@ -1609,3 +1609,40 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* Done-column paging footer ("Load more") — the server pages the done
+   column (done_pagination), the footer loads the next page of history. */
+.hermes-kanban-done-more {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.25rem 0.25rem;
+  border-top: 1px solid color-mix(in srgb, var(--color-border, transparent) 60%, transparent);
+}
+
+.hermes-kanban-done-more-count {
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+
+.hermes-kanban-done-more-btn {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border, transparent);
+  background: transparent;
+  color: var(--color-foreground);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.hermes-kanban-done-more-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-muted-foreground) 12%, transparent);
+}
+
+.hermes-kanban-done-more-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

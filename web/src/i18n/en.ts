@@ -862,6 +862,9 @@ export const en: Translations = {
       done: "Completed",
       archived: "Archived",
     },
+    loadMoreDone: "Load more",
+    doneLoadingMore: "Loading…",
+    doneLoadedCount: "{loaded} of {total} loaded",
     confirmDone:
       "Mark this task as done? The worker's claim is released and dependent children become ready.",
     confirmArchive:
