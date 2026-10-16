@@ -267,7 +267,9 @@ def notify_task_updated(
 
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
-    "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
+    "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers",
+    "reaped_orphan_runs", "released_orphan_claims",
+    "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
@@ -2597,7 +2599,14 @@ def reclaim_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
 ) -> bool:
     """Operator reclaim regardless of TTL: release the claim, restore the source
-    phase, reset the failure counter. False when not running."""
+    phase, reset the failure counter. False when not running — or when the
+    worker survived termination: like :func:`release_stale_claims`, the claim is
+    NEVER released while our own worker (or its process group, where knowable)
+    is still alive. A surviving running worker gets the standard defer (extended
+    claim TTL + ``reclaim_deferred`` event, reason ``manual_reclaim_worker_alive``);
+    a non-running claim holder is left untouched for the guarded
+    :func:`kanban_db_dispatch.reclaim_stale_ready_claims` sweep, which owns that
+    termination path. Both return False — no reclaim happened, retry later."""
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -2607,8 +2616,20 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    prev_status = row["status"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+    # Never release a claim while our own worker is still alive (or its
+    # process group is confirmably alive): that would spawn a duplicate
+    # beside it. Hold instead of releasing — running claims defer, the
+    # non-running sweep owns its own guarded path.
+    if _worker_survived_termination(termination):
+        if prev_status == "running":
+            _defer_reclaim_for_live_worker(
+                conn, task_id, prev_lock, int(time.time()), termination,
+                reason="manual_reclaim_worker_alive",
+            )
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -3771,17 +3792,24 @@ def invalidate_descendants_for_parent_reopen(
     ``descendant_invalidated`` event, the legacy ``status`` event the live feed
     renders, and a comment naming the ancestor. Running descendants are closed
     ``reclaimed`` and their workers killed strictly post-commit (audit trail
-    before death) — when composed, the CALLER must drain ``terminations``
-    after its own commit. ``consecutive_failures`` resets (deliberate operator
-    action), the opposite of :func:`reopen_review_task`.
+    before death) — when composed, the CALLER must drain ``terminations`` after
+    its own commit via :func:`_drain_invalidation_terminations` (survivor guard
+    + CAS claim re-protection included; a bare ``_terminate_reclaimed_worker``
+    loop would release a surviving worker's claim silently — double-spawn
+    window). ``consecutive_failures`` resets (deliberate operator action), the
+    opposite of :func:`reopen_review_task`.
 
     Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
-    "terminations": [(worker_pid, claim_lock, worker_started_at)]}``.
+    "terminations": [(worker_pid, claim_lock, worker_started_at)],
+    "termination_task_ids": [...]}`` — ``termination_task_ids`` runs parallel
+    to ``terminations`` so post-commit drains can re-protect a surviving
+    worker's claim (see :func:`_drain_invalidation_terminations`).
     """
     caller_owns_txn = bool(conn.in_transaction)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    termination_task_ids: list[str] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -3810,6 +3838,7 @@ def invalidate_descendants_for_parent_reopen(
             elif previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
                 terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
+                termination_task_ids.append(row["id"])
                 run_id = _end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=f"ancestor {task_id} reopened",
@@ -3848,10 +3877,112 @@ def invalidate_descendants_for_parent_reopen(
             invalidated.append(entry)
     if not caller_owns_txn:
         # Standalone: committed above, audit trail durable, safe to kill now.
-        # Composed calls leave this to the caller post-commit.
-        for pid, claim_lock, started_at in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
-    return {"invalidated": invalidated, "terminations": terminations}
+        # Composed calls leave this to the caller post-commit. The drain is
+        # shared (survivor guard + CAS claim re-protection) so every
+        # invalidation surface closes the same double-writer window.
+        _drain_invalidation_terminations(conn, terminations, termination_task_ids)
+    return {
+        "invalidated": invalidated,
+        "terminations": terminations,
+        "termination_task_ids": termination_task_ids,
+    }
+
+
+def _reprotect_demoted_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    worker_pid: Optional[int],
+    claim_lock: Optional[str],
+    now: int,
+    termination: dict,
+    *,
+    reason: str = "invalidation_descendant_survived",
+) -> bool:
+    """CAS re-protect the claim of a demoted row whose worker survived.
+
+    Invalidation demotes atomically (claim fields cleared in the demotion txn)
+    and terminates strictly post-commit (events-before-termination). If that
+    termination cannot verify death, the demoted row would sit claim-free in a
+    spawnable phase — the claim-free spawn gate (``claim_lock IS NULL``) would
+    happily double-spawn beside the survivor. This re-arms
+    ``claim_lock``/``worker_pid``/``claim_expires`` (now +
+    ``RECLAIM_DEFER_GRACE_SECONDS``) — only while the row is still in a
+    spawnable demotion target (``todo`` / ``ready`` / ``review``: the
+    invalidation demotes to ``todo``, the dashboard's direct status write to
+    ``ready`` / ``review`` / ``todo``) AND still claim-free (CAS; a foreign
+    claim is never overwritten) — and records a ``reclaim_deferred`` event so
+    the hold is visible. The guarded non-running sweep
+    (:func:`kanban_db_dispatch.reclaim_stale_ready_claims`) retakes the
+    termination later.
+
+    Known residual (accepted, documented): the window between the demotion
+    commit and this re-protection lasts as long as the failed termination
+    attempt itself — grace polls (~5 s) + SIGKILL + the group sweep, i.e.
+    seconds, not microseconds. The CAS re-protection and the
+    events-before-termination ordering stay as designed.
+    """
+    if not claim_lock:
+        return False
+    grace = now + RECLAIM_DEFER_GRACE_SECONDS
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_lock = ?, worker_pid = ?, claim_expires = ? "
+            "WHERE id = ? AND status IN ('todo', 'ready', 'review') "
+            "AND claim_lock IS NULL",
+            (claim_lock, worker_pid, grace, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "claim_lock": claim_lock,
+            "worker_pid": int(worker_pid) if worker_pid else None,
+            "claim_expires_now": grace,
+        }
+        payload.update(termination)
+        _append_event(conn, task_id, "reclaim_deferred", payload)
+    return True
+
+
+def _drain_invalidation_terminations(
+    conn: sqlite3.Connection,
+    terminations: list[tuple[Optional[int], Optional[str], Optional[int]]],
+    task_ids: Optional[list[str]] = None,
+    *,
+    signal_fn=None,
+    reason: str = "invalidation_descendant_survived",
+) -> None:
+    """Post-commit termination drain for done-reopen invalidation.
+
+    Shared by every invalidation surface (the standalone
+    :func:`invalidate_descendants_for_parent_reopen` call plus composed callers
+    such as the dashboard's ``_set_status_direct``): the caller committed the
+    demotion, this runs afterwards. Terminates each demoted descendant's
+    worker; when death cannot be verified (worker or group confirmably alive),
+    the demoted row's claim is re-protected via :func:`_reprotect_demoted_claim`
+    so no duplicate spawn starts beside the survivor — releasing the claim
+    silently here would leave exactly the zombie-run double-writer window open
+    on the invalidation surface. ``reason`` labels the surface in the
+    ``reclaim_deferred`` event (the dashboard direct status write passes its
+    own, separate from the invalidation label).
+    """
+    if not terminations:
+        return
+    now = int(time.time())
+    for idx, entry in enumerate(terminations):
+        pid, claim_lock = entry[0], entry[1]
+        started_at = entry[2] if len(entry) > 2 else None
+        termination = _terminate_reclaimed_worker(
+            pid, claim_lock, signal_fn=signal_fn, started_at=started_at,
+        )
+        if not _worker_survived_termination(termination):
+            continue
+        task_id = task_ids[idx] if task_ids and idx < len(task_ids) else None
+        if task_id:
+            _reprotect_demoted_claim(
+                conn, task_id, pid, claim_lock, now, termination,
+                reason=reason,
+            )
 
 
 def specify_triage_task(

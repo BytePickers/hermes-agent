@@ -3139,3 +3139,71 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+class TestNotFoundCallFormHint:
+    """Regression: process not_found / form errors must teach the correct
+    call form (tool name ``process``, field ``session_id``), not just name
+    the failure — agents used to retry blindly on the bare message."""
+
+    def test_poll_not_found_shows_call_form(self, registry):
+        result = registry.poll("proc_nosuch1234")
+        assert result["status"] == "not_found"
+        assert "process(action='poll'" in result["error"]
+        assert "session_id='<ID>'" in result["error"]
+        assert "process(action='list')" in result["error"]
+
+    def test_not_found_shows_concrete_example_form(self, registry):
+        """R1-B1 regression: the not_found hint must name a single concrete
+        call form (one enum value), not a union like poll'|'log'|'wait'|'kill',
+        and must cover the stdin actions that share this path."""
+        result = registry.poll("proc_nosuch1234")
+        assert result["status"] == "not_found"
+        # Exactly one concrete example form, no union syntax.
+        assert "process(action='poll', session_id='<ID>')" in result["error"]
+        assert "poll'|'log" not in result["error"]
+        # Stdin actions reaching the same helper get a concrete form too.
+        assert "process(action='write', session_id='<ID>', data='<text>')" in result["error"]
+
+    def test_wait_not_found_shows_call_form(self, registry):
+        result = registry.wait("proc_nosuch1234", timeout=1)
+        assert result["status"] == "not_found"
+        assert "process(action='poll'" in result["error"]
+        assert "session_id='<ID>'" in result["error"]
+
+    def test_kill_not_found_shows_call_form(self, registry):
+        result = registry.kill_process("proc_nosuch1234")
+        assert result["status"] == "not_found"
+        assert "process(action='poll'" in result["error"]
+        assert "session_id='<ID>'" in result["error"]
+
+    def test_log_not_found_shows_call_form(self, registry):
+        result = registry.read_log("proc_nosuch1234")
+        assert result["status"] == "not_found"
+        assert "session_id='<ID>'" in result["error"]
+
+    def test_write_stdin_not_found_shows_call_form(self, registry):
+        result = registry.write_stdin("proc_nosuch1234", "x")
+        assert result["status"] == "not_found"
+        assert "session_id='<ID>'" in result["error"]
+
+    def test_close_stdin_not_found_shows_call_form(self, registry):
+        result = registry.close_stdin("proc_nosuch1234")
+        assert result["status"] == "not_found"
+        assert "session_id='<ID>'" in result["error"]
+
+    def test_missing_session_id_error_shows_call_form(self):
+        from tools.process_registry import _handle_process
+
+        result = _handle_process({"action": "poll", "session_id": ""}, task_id="t1")
+        assert "session_id is required for poll" in result
+        assert "process(action='poll', session_id='<ID>')" in result
+        assert "process(action='list')" in result
+
+    def test_unknown_action_error_shows_example_form(self):
+        from tools.process_registry import _handle_process
+
+        result = _handle_process({"action": "bogus"}, task_id="t1")
+        assert "Unknown process action: bogus" in result
+        assert "process(action='poll', session_id='<ID>')" in result
+        assert "process(action='list')" in result

@@ -289,7 +289,19 @@ def get_board(
     include_archived: bool = Query(False),
     board: Optional[str] = _BOARD_Q,
     workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
-    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key")):
+    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
+    done_limit: int = Query(
+        50, ge=1, le=200,
+        description=(
+            "Max done cards per board read (t_7b8d2a65 point 5): the done column is "
+            "completion history and grows without bound, dominating the refresh "
+            "payload. Page deeper with done_offset; full text stays on /tasks/:id."
+        ),
+    ),
+    done_offset: int = Query(
+        0, ge=0,
+        description="Offset into the done column (newest-completed-first).",
+    )):
     """Full board grouped by status column; omitting ``board`` uses the active board
     (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``)."""
     with _board_conn(board) as (board, conn):
@@ -332,13 +344,26 @@ def get_board(
         columns["done"].sort(key=lambda d: d["id"], reverse=True)
         columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
 
+        # Done column is paginated (t_7b8d2a65 point 5): with thousands of
+        # completed cards the full history dominated the refresh payload
+        # (~19 MB). Serve one window (default 50) without card bodies — the
+        # full text stays on /tasks/:id; done_total + done_offset let clients
+        # page deeper. Every other column is unchanged.
+        done_tasks = columns["done"]
+        done_total = len(done_tasks)
+        columns["done"] = [
+            {k: v for k, v in d.items() if k != "body"}
+            for d in done_tasks[done_offset:done_offset + done_limit]
+        ]
+
         # Queue columns keep list_tasks' dispatch order (priority DESC, created_at ASC).
         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
         assignees = [r["assignee"] for r in conn.execute(
             "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
         return {
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
-            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
+            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time()),
+            "done_pagination": {"total": done_total, "offset": int(done_offset), "limit": int(done_limit)}}
 
 
 _read_board = coalesced_read(get_board)
@@ -351,6 +376,8 @@ async def get_board_endpoint(
     board: Optional[str] = _BOARD_Q,
     workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
+    done_limit: int = Query(50, ge=1, le=200),
+    done_offset: int = Query(0, ge=0),
 ):
     # Resolve selection before keying so a board switch cannot join an older read.
     return await _read_board(
@@ -359,6 +386,8 @@ async def get_board_endpoint(
         board=board or kanban_db.get_current_board(),
         workflow_template_id=workflow_template_id,
         current_step_key=current_step_key,
+        done_limit=done_limit,
+        done_offset=done_offset,
     )
 
 
@@ -724,8 +753,27 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
 def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
-    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
+    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits.
+
+    The direct demotion's worker termination enters the shared survivor-guarded
+    drain WITH its task id (release site of the claim-release class): when the
+    worker survives, the demoted row's claim is re-protected on the demotion
+    target (``ready`` / ``review`` / ``todo``) instead of being silently
+    released beside a live writer.
+
+    The two entry paths into this function drain through SEPARATE list pairs
+    with their own event labels: survivors of the direct demotion record
+    ``direct_status_demotion_survived``, while survivors of the reopen
+    invalidation's descendant terminations record
+    ``invalidation_descendant_survived`` — the same label the standalone
+    invalidation surfaces already write. The branches are mutually exclusive
+    per call (``running`` vs. a terminal prior status), so exactly one of the
+    two drains ever carries entries.
+    """
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    termination_task_ids: list[str] = []
+    reopen_terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    reopen_termination_task_ids: list[str] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
@@ -758,16 +806,27 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
                 conn, task_id, outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)")
             terminations.append((prev["worker_pid"], prev["claim_lock"], prev["worker_started_at"]))
+            # The drain maps survivor -> demoted row by task id; without it the
+            # re-protection could never fire on this surface.
+            termination_task_ids.append(task_id)
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
         if reopening_satisfied_parent:
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
-            # back worker terminations to perform post-commit.
+            # back worker terminations to perform post-commit. DEDICATED lists: their
+            # survivors must record the invalidation label, never the direct-demotion one.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
-            terminations.extend(result["terminations"])
-    for pid, claim_lock, started_at in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+            reopen_terminations.extend(result["terminations"])
+            reopen_termination_task_ids.extend(result["termination_task_ids"])
+    kanban_db._drain_invalidation_terminations(
+        conn, terminations, termination_task_ids,
+        reason="direct_status_demotion_survived",
+    )
+    kanban_db._drain_invalidation_terminations(
+        conn, reopen_terminations, reopen_termination_task_ids,
+        reason="invalidation_descendant_survived",
+    )
     # Re-opening something may have made children stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)

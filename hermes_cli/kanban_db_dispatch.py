@@ -25,6 +25,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli import kanban_pr_state as _pr_state
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -87,6 +88,29 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Re-queue event kinds that release the ``active_pr`` hold when they arrive
+# STRICTLY AFTER the newest PR-URL comment (content of upstream PRs #162/#163,
+# t_ebaaee1c): a deliberate "run it again" order — status flip, promotion,
+# unblock, reclaim — re-arms the card for a fresh run the way a handoff does.
+# The dispatcher's default_assignee write only ever emits ``assigned`` events,
+# so it can never ride this path (payload guard in _is_handoff_event).
+_RESPAWN_GUARD_REQUEUE_KINDS = frozenset(
+    {"status", "promoted", "unblocked", "reclaimed"}
+)
+
+# Single source of truth for the section-4 event query: the handoff kinds
+# (payload-validated by _is_handoff_event) plus the re-queue kinds above, so
+# the SQL list and the Python-side release check cannot drift apart.
+_RESPAWN_GUARD_RELEASE_KIND_SQL = ", ".join(
+    f"'{kind}'"
+    for kind in (
+        "assigned",
+        "changes_requested",
+        "review_reopened",
+        *_RESPAWN_GUARD_REQUEUE_KINDS,
+    )
+)
+
 
 @dataclass
 class DispatchResult:
@@ -111,6 +135,16 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    reaped_orphan_runs: list[int] = field(default_factory=list)
+    """Run ids closed as ``failed/reaped_orphan`` by :func:`reap_orphaned_runs`
+    (ghost rows: the card left ``running`` before its run row ended)."""
+    released_orphan_claims: list[str] = field(default_factory=list)
+    """Task ids whose stale claim pointer (run already over, card not running)
+    was cleared by :func:`release_orphaned_task_claims`."""
+    stale_ready_reclaimed: list[str] = field(default_factory=list)
+    """Task ids whose stale claim on a non-running, spawnable card was cleared
+    by :func:`reclaim_stale_ready_claims` (incl. retaken survivor-guard
+    re-protections); a live worker keeps its claim instead (extended)."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -440,6 +474,192 @@ def _sigkill(kill, pid: int) -> bool:
         return False
 
 
+def _signal_worker_group(pid: int, sig: int, signal_fn=None) -> str:
+    """Signal the worker's process group, falling back to pid-only.
+
+    Dispatcher workers spawn via ``start_new_session=True`` (:func:`_default_spawn`),
+    so the recorded worker pid is its own session AND process-group leader
+    (``pgid == pid``) and every in-flight tool child lives in that group.
+    Signalling the group is what reaches those children; a pid-only signal
+    orphans them (zombie-run / double-writer risk). Returns ``"group"`` or
+    ``"pid"`` — what actually got the signal. Raises ``ProcessLookupError``
+    when neither the group nor the pid exists.
+    """
+    if signal_fn is not None:
+        signal_fn(int(pid), sig)
+        return "pid"
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        try:
+            killpg(int(pid), sig)
+            return "group"
+        except PermissionError:
+            # pid recycled into a foreign group we may not signal —
+            # degrade to the pid-only path (pre-group behaviour).
+            pass
+        except ProcessLookupError:
+            # No group with that id: the target is alive but NOT its own
+            # group leader (never spawned detached), so signalling the
+            # inherited group would hit a foreign group. Signal the pid
+            # itself; a gone pid raises from ``os.kill`` below.
+            pass
+    os.kill(int(pid), sig)
+    return "pid"
+
+
+def _group_alive(pid: int) -> Optional[bool]:
+    """True when any LIVE member of the worker's process group remains.
+
+    POSIX-only probe. ``killpg(pgid, 0)`` only tells whether the group
+    still exists — and a just-SIGKILLed child lingers as a zombie until
+    reaped, which would keep the group "existing" forever. So after the
+    cheap existence probe, enumerate ``/proc`` members and treat zombie
+    members as dead, mirroring :func:`_pid_alive`. Returns ``None`` where
+    group state is unknowable (no ``os.killpg``, non-Linux member
+    enumeration, unreadable /proc) — callers must treat ``None`` as
+    "unknown / unverifiable" and never claim group verification. A
+    ``PermissionError`` on the probe itself means the group exists but
+    is not ours (recycled pid) — reported conservatively alive.
+    """
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return None
+    try:
+        killpg(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:  # pragma: no cover - defensive
+        return None
+    if sys.platform != "linux":
+        # No cheap member enumeration — group state is UNKNOWABLE here, not
+        # confirmably alive. The historical ``True`` ("conservatively alive")
+        # would make the release guard defer forever on hosts that can never
+        # verify a group; ``None`` keeps the leader-only release contract
+        # there. The killpg probe above still returns False when the whole
+        # group is gone, so dead-group verification stays available.
+        return None
+    target = int(pid)
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "r", encoding="utf-8") as f:
+                    stat = f.read()
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            # ``comm`` may contain spaces/parens: fields resume after the
+            # final ')'. fields[0] = state (field 3), fields[2] = pgrp
+            # (field 5) in proc(5) numbering.
+            try:
+                fields = stat[stat.rindex(")") + 2:].split()
+                if int(fields[2]) != target:
+                    continue
+                if "Z" not in fields[0]:
+                    return True
+            except (ValueError, IndexError):
+                continue
+    except OSError:  # pragma: no cover - defensive
+        return None
+    return False
+
+
+def _terminate_process_tree(
+    pid: int,
+    *,
+    signal_fn=None,
+    grace_polls: int = 10,
+    started_at=None,
+) -> dict[str, Any]:
+    """SIGTERM the worker's process tree, then SIGKILL after a grace window.
+
+    Signals the worker's whole process group (pgid == pid for dispatcher
+    workers, see :func:`_signal_worker_group`), waits up to
+    ``grace_polls * 0.5`` s for the leader to die, escalates to SIGKILL
+    when the leader survived, and finally sweeps surviving group members
+    (a tool child can outlive its leader's SIGTERM death and keep
+    writing on the task beside the re-spawned worker — the zombie-run
+    vector). Returns an info dict with ``signal_mode`` ("group"/"pid"),
+    ``sigkill`` (bool) and ``group_verified_dead`` (True/False, or None
+    when group state is unknowable on this platform).
+
+    ``started_at`` is the spawn-time fingerprint carried through from the
+    reclaim row (same contract as :func:`_worker_alive`): every wait probe
+    and every further group signal re-verifies the worker identity — bare
+    existence never justifies a signal (#99558). When the leader dies and
+    its pid is recycled mid-wait, the sweep aborts with ``terminated=True``
+    and ``pid_recycled=True``: the worker is gone (which is what the
+    termination wanted) and a stranger's group is never signalled. A
+    legacy row without a fingerprint keeps the bare-existence answer, and
+    UNVERIFIED spawns must be resolved by the caller before any signal
+    (:func:`_terminate_reclaimed_worker` refuses them at its entry).
+    """
+    info: dict[str, Any] = {
+        "terminated": False,
+        "signal_mode": None,
+        "sigkill": False,
+        "group_verified_dead": None,
+    }
+    _kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    try:
+        info["signal_mode"] = _signal_worker_group(pid, signal.SIGTERM, signal_fn)
+    except ProcessLookupError:
+        # Nothing left to signal — that's a successful termination, not a
+        # survival. Leaving terminated=False here would make the reclaim guard
+        # misread a dead worker as still-alive and defer forever.
+        info["terminated"] = True
+        alive = _group_alive(pid)
+        if alive is not None:
+            info["group_verified_dead"] = not alive
+        return info
+    except OSError:
+        return info
+
+    for _ in range(grace_polls):
+        if not _worker_alive(pid, started_at):
+            break
+        time.sleep(0.5)
+
+    if _worker_alive(pid, started_at):
+        try:
+            _signal_worker_group(pid, _kill_signal, signal_fn)
+            info["sigkill"] = True
+        except (ProcessLookupError, OSError):
+            pass
+    elif _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
+        # The leader died inside the grace window and a stranger now owns the
+        # pid: the worker is gone (which is what the termination wanted) and
+        # any further signal on the bare number could hit the stranger's
+        # group. Abort — a foreign group is never signalled.
+        info["terminated"] = True
+        info["pid_recycled"] = True
+        return info
+
+    # The leader can die on SIGTERM while a tool child survives in the same
+    # group. Verify the GROUP is gone and sweep survivors — but only while
+    # the pid still identifies our worker: a mid-wait recycled number would
+    # route the group signal into a stranger's group (re-checked above).
+    alive = _group_alive(pid)
+    if alive:
+        try:
+            _signal_worker_group(pid, _kill_signal, signal_fn)
+            info["sigkill"] = True
+        except (ProcessLookupError, OSError):
+            pass
+        for _ in range(10):
+            alive = _group_alive(pid)
+            if not alive:
+                break
+            time.sleep(0.1)
+    if alive is not None:
+        info["group_verified_dead"] = not alive
+
+    info["terminated"] = not _worker_alive(pid, started_at)
+    return info
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -452,7 +672,13 @@ def _terminate_reclaimed_worker(
     signalled — the worker is gone, which is what the reclaim wanted (``terminated`` = True). An
     UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
     it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
-    spawning a duplicate beside it."""
+    spawning a duplicate beside it.
+
+    Termination covers the worker's WHOLE process group, not just the leader pid (see
+    :func:`_terminate_process_tree`): dispatcher workers are spawned with
+    ``start_new_session=True``, and a pid-only signal would orphan in-flight tool children, which
+    keep writing on the task beside the re-spawned worker (zombie-run / double-writer risk).
+    """
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
@@ -480,24 +706,7 @@ def _terminate_reclaimed_worker(
         return info
 
     info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Already gone = successful termination. Leaving terminated=False would
-        # make the reclaim guard misread a dead worker as alive and defer forever.
-        info["terminated"] = True
-        return info
-    except OSError:
-        return info
-
-    if _poll_worker_exit(pid, started_at):
-        info["terminated"] = True
-        return info
-    if _worker_alive(pid, started_at):
-        if not _sigkill(kill, pid):
-            return info
-        info["sigkill"] = True
-    info["terminated"] = not _worker_alive(pid, started_at)
+    info.update(_terminate_process_tree(int(pid), signal_fn=signal_fn, started_at=started_at))
     return info
 
 
@@ -560,18 +769,34 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
 
 
 def _worker_survived_termination(termination: dict) -> bool:
-    """True when we tried to kill our own host-local worker and it is still alive.
+    """True when we tried to kill our own host-local worker and it may live on.
 
     Reclaiming then would release the claim and spawn a second worker while the
     first still runs — the duplication loop. Only host-local workers we actually
     signalled count; a non-local lock or no-op attempt (no ``os.kill``) must fall
     through to the normal release path since we cannot manage that worker anyway.
+
+    Release contract (claim-release survivor guard): a claim is released only
+    after VERIFIED death of the worker AND — where knowable — its whole
+    process group. Two survival forms hold the claim:
+
+    * the leader is still alive (``terminated`` false), and
+    * the leader is reported dead while the group is CONFIRMABLY alive
+      (``group_verified_dead is False`` — e.g. a D-state tool child that
+      SIGKILL cannot reap yet; the last open form of the zombie-run
+      double-writer vector).
+
+    ``group_verified_dead is None`` (unknowable on this platform) keeps the
+    leader-only contract instead of deferring forever.
     """
-    return bool(
+    if not (
         termination.get("host_local")
         and (termination.get("termination_attempted") or termination.get("signal_refused"))
-        and not termination.get("terminated")
-    )
+    ):
+        return False
+    if not termination.get("terminated"):
+        return True
+    return termination.get("group_verified_dead") is False
 
 
 def _defer_reclaim_for_live_worker(
@@ -652,6 +877,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+
+    Release contract (claim-release survivor guard): the claim is released
+    only after VERIFIED death of the worker AND — where knowable — its
+    whole process group (:func:`_worker_survived_termination`). When the
+    termination cannot verify death, the claim is HELD (extended by
+    ``RECLAIM_DEFER_GRACE_SECONDS``, visible ``reclaim_deferred`` event,
+    reason ``max_runtime_worker_alive``) and the kill is retried on the
+    next dispatch tick — no ``timed_out`` completion and no
+    failure-counter bump happen until the death is verified.
     """
     timed_out: list[str] = []
     now = int(time.time())
@@ -687,18 +921,31 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
                              "identity; not signalled", tid, pid)
             continue
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone.
-        killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
-                killed = _sigkill(kill, pid)
+        # SIGTERM then SIGKILL after a grace window, routed through the guarded
+        # reclaim terminator so this path obeys the same release contract as
+        # every other termination path: group-aware (in-flight tool children
+        # included — a pid-only signal would orphan them) and fingerprint-
+        # checked (a recycled PID is never signalled; the worker is already
+        # gone). Workers wanting a cleaner shutdown install their own SIGTERM
+        # handler before the grace expires.
+        termination = _terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn, started_at=started_at,
+        )
+        killed = bool(termination.get("sigkill"))
+
+        # Never release a claim while our own worker — or a confirmably alive
+        # group member — survived the kill: the next dispatch tick would spawn
+        # a duplicate writer beside it. Hold the claim and retry the
+        # termination on a later tick (self-correcting: not spawning a
+        # duplicate is what lets the throttled worker finally die). No
+        # ``timed_out`` completion and no failure-counter bump happen until
+        # the death is verified.
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -906,6 +1153,302 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
         )
     return reconciled
+
+
+# Ghost-run harvest hysteresis: a run whose card left 'running' is closed only
+# after this absolute minimum age, so a card transition racing a fresh spawn
+# (claim, park, complete within minutes) never trips the sweep (planer ruling:
+# status 'running' AND dead heartbeat AND absolute minimum age).
+GHOST_RUN_MIN_AGE_SECONDS = 15 * 60
+
+
+def reap_orphaned_runs(conn: sqlite3.Connection) -> list[int]:
+    """Close ``running`` task_runs whose card has left ``running`` (ghost rows).
+
+    Every existing sweep keys on ``tasks.status = 'running'``; a card that
+    moves on (parked, completed, re-claimed elsewhere) before its run row ends
+    leaves that row ``running`` forever — heartbeat updates are bound to the
+    running card, so nothing ever closes it (t_56037ffe: rows 8819/9213/9621/
+    10087 ran 2.2-6.8 days and inflated every running-count, shrinking real
+    spawn capacity). A ghost run IS a failed run: it is closed per row (own
+    write txn, CAS on ``status='running' AND ended_at IS NULL``) as
+    ``failed/reaped_orphan`` with the origin in ``metadata`` — no new terminal
+    state vocabulary — plus a visible ``ghost_run_reaped`` event on the card;
+    nothing is deleted silently. A stale claim pointer on the departed card is
+    cleared in the same transaction, else the card stays unspawnable although
+    its run is over (run 10814: card blocked 65 min after the dispatcher had
+    already reaped the row). Live host-local workers are never touched: this is
+    pure bookkeeping, no signals — a slow-but-alive worker survives, its row is
+    retried next tick. ``done``/``archived`` cards keep their claim fields
+    (forensics contract of ``_end_run``; they never spawn).
+
+    Returns the reaped run ids.
+    """
+    now = int(time.time())
+    reaped: list[int] = []
+    host_prefix = _kb._host_prefix()
+    rows = conn.execute(
+        "SELECT r.id, r.task_id, r.started_at, r.last_heartbeat_at, "
+        "       r.worker_pid, r.worker_started_at, r.claim_lock, "
+        "       t.status AS task_status, t.current_run_id AS card_run_id "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.status = 'running' AND r.ended_at IS NULL "
+        "  AND (t.status != 'running' "
+        "       OR (t.current_run_id IS NOT NULL AND t.current_run_id != r.id)) "
+        "  AND (r.last_heartbeat_at IS NULL "
+        "       OR ? - r.last_heartbeat_at > ?) "
+        "  AND r.started_at <= ? - ?",
+        (now, _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS, now, GHOST_RUN_MIN_AGE_SECONDS),
+    ).fetchall()
+    for row in rows:
+        pid = row["worker_pid"]
+        if (pid
+                and str(row["claim_lock"] or "").startswith(host_prefix)
+                and _worker_alive(pid, row["worker_started_at"])):
+            # Live host-local worker beside a departed card: leave it alone,
+            # its row closes once the worker finishes (or a sweep kills it).
+            continue
+        tid = row["task_id"]
+        run_id = row["id"]
+        try:
+            with _kb.write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE task_runs SET status = 'failed', outcome = 'reaped_orphan', "
+                    "ended_at = ?, error = ?, metadata = ? "
+                    "WHERE id = ? AND status = 'running' AND ended_at IS NULL",
+                    (now, "ghost run: card left 'running' before the run ended", None, run_id),
+                )
+                if cur.rowcount != 1:
+                    continue  # lost the race — next tick re-checks
+                # Coupled claim release: only when the card still points at
+                # THIS run and has left the spawning states for good.
+                claim_released = False
+                if (row["card_run_id"] == run_id
+                        and row["task_status"] not in ("running", "done", "archived")):
+                    claim_released = conn.execute(
+                        "UPDATE tasks SET current_run_id = NULL, claim_lock = NULL, "
+                        "claim_expires = NULL "
+                        "WHERE id = ? AND current_run_id = ? "
+                        "  AND status NOT IN ('running', 'done', 'archived')",
+                        (tid, run_id),
+                    ).rowcount == 1
+                metadata = {
+                    "reap_reason": "ghost_run_card_departed",
+                    "reap_at": now,
+                    "reap_by": "dispatcher",
+                    "run_age_seconds": now - int(row["started_at"]),
+                    "heartbeat_age_seconds": (
+                        now - int(row["last_heartbeat_at"])
+                        if row["last_heartbeat_at"] is not None else None
+                    ),
+                    "task_status": row["task_status"],
+                    "card_run_id": row["card_run_id"],
+                    "claim_released": claim_released,
+                }
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (_kb._json_or_null(metadata), run_id),
+                )
+                _kb._append_event(
+                    conn, tid, "ghost_run_reaped",
+                    {"run_id": run_id, **metadata}, run_id=run_id,
+                )
+            reaped.append(run_id)
+            _kb._log.info(
+                "kanban dispatch: reaped ghost run %s of task %s "
+                "(card status %r, age %ss, claim released: %s)",
+                run_id, tid, row["task_status"], metadata["run_age_seconds"], claim_released,
+            )
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: ghost run reap failed for run %s (task %s)",
+                run_id, tid, exc_info=True,
+            )
+    return reaped
+
+
+def release_orphaned_task_claims(conn: sqlite3.Connection) -> list[str]:
+    """Clear stale claim pointers on cards whose run is already over.
+
+    The run row was reaped/ended by a path that never touched the card's CAS
+    (the card is no longer ``running``), but the card kept ``current_run_id`` +
+    an expired ``claim_lock``/``claim_expires`` — and ``_lane_rows`` requires
+    ``claim_lock IS NULL``, so the card was unspawnable although nothing ran
+    (run 10814: blocked 65 min past its run's end). Candidates: not
+    ``running``/``done``/``archived`` (spawn-blocking lanes), expired claim,
+    and either no run pointer or a pointer at an ended/missing run — a pointer
+    at a still-live run belongs to :func:`reap_orphaned_runs`'s coupled
+    release in the same tick. Pure bookkeeping: no status change, no failure
+    counters; the before-values go into a visible ``orphaned_claim_released``
+    event, nothing is deleted silently. ``done``/``archived`` cards keep their
+    fields (forensics contract; they never spawn).
+
+    Returns the released task ids.
+    """
+    now = int(time.time())
+    released: list[str] = []
+    rows = conn.execute(
+        "SELECT t.id, t.status, t.current_run_id, t.claim_lock, t.claim_expires "
+        "FROM tasks t "
+        "WHERE t.status NOT IN ('running', 'done', 'archived') "
+        "  AND t.claim_lock IS NOT NULL AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ? "
+        "  AND (t.current_run_id IS NULL OR NOT EXISTS ("
+        "        SELECT 1 FROM task_runs r "
+        "        WHERE r.id = t.current_run_id "
+        "          AND r.status = 'running' AND r.ended_at IS NULL))",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        before = {
+            "reason": "orphaned_claim",
+            "task_status": row["status"],
+            "current_run_id": row["current_run_id"],
+            "claim_lock": row["claim_lock"],
+            "claim_expires": _kb._opt_int(row["claim_expires"]),
+            "now": now,
+        }
+        try:
+            with _kb.write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET current_run_id = NULL, claim_lock = NULL, "
+                    "claim_expires = NULL "
+                    "WHERE id = ? AND claim_lock IS ? AND claim_expires IS ?",
+                    (tid, row["claim_lock"], row["claim_expires"]),
+                )
+                if cur.rowcount != 1:
+                    continue  # lost the race — next tick re-checks
+                _kb._append_event(conn, tid, "orphaned_claim_released", before)
+            released.append(tid)
+            _kb._log.info(
+                "kanban dispatch: released orphaned claim on task %s "
+                "(status %r, run %s over, expired %s)",
+                tid, row["status"], row["current_run_id"], row["claim_expires"],
+            )
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: orphaned claim release failed for task %s",
+                tid, exc_info=True,
+            )
+    return released
+
+
+def reclaim_stale_ready_claims(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[str]:
+    """Reclaim stale claims lingering on non-running, spawnable tasks.
+
+    A claim lock is a ``running``-phase artifact: once a task leaves
+    ``running`` for a spawnable phase (``todo`` / ``ready`` / ``scheduled``
+    / ``review``) its ``claim_lock`` / ``claim_expires`` / ``worker_pid``
+    must be cleared. When that invariant is violated the card is silently
+    stranded for ever:
+
+      - the dispatch picker only selects rows with ``claim_lock IS NULL``,
+      - ``claim_task`` refuses any row with ``claim_lock IS NOT NULL``, and
+      - ``release_stale_claims`` only scans ``status='running'`` cards, so
+        it never sees the leftover lock on a non-running row.
+
+    A non-running card carrying a stale claim is therefore never spawned and
+    never reclaimed — it sits invisible and dead on the board. This pass
+    finds those offenders, clears the leaked claim (closing any orphaned
+    run), and surfaces a ``reclaimed`` event, so the next dispatch tick can
+    spawn the card normally. It also owns the retake of re-protected claims
+    left by the invalidation/demotion survivor guard
+    (:func:`kanban_db._reprotect_demoted_claim`): a demoted row whose worker
+    survived termination holds a fresh claim here until the termination is
+    retried and death is verified.
+
+    Survivor guard mirrors :func:`release_stale_claims`: if the recorded
+    worker PID survives termination, the claim is NOT cleared — the window
+    is extended instead so the liveness-blind orphan-claim sweep
+    (:func:`release_orphaned_task_claims`, later in the same reclaim phase)
+    cannot release the lock beside a live worker, and the termination is
+    retried on a later tick. Returns the list of reclaimed task ids. Safe
+    to call every tick.
+    """
+    now = int(time.time())
+    reclaimed: list[str] = []
+    rows = conn.execute(
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at "
+        "FROM tasks "
+        "WHERE status NOT IN ('running', 'done', 'archived') "
+        "  AND claim_lock IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        claim_expires = row["claim_expires"]
+        # Only reclaim genuinely stale (expired) or structurally-broken
+        # (missing expiry) claims. A future expiry on a non-running task is
+        # still defective bookkeeping, but we respect its window and defer a
+        # tick so we never race a transition that is still in flight.
+        if claim_expires is not None and claim_expires > now:
+            continue
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            started_at=_kb._row_get(row, "worker_started_at"),
+        )
+        # Never release a claim while our own worker is still alive: leaving a
+        # stale lock in place is safer than spawning a duplicate beside a live
+        # worker. Extend the window past the orphan-claim sweep later in this
+        # phase (it is liveness-blind) and retry the termination next tick.
+        if _worker_survived_termination(termination):
+            grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
+            with _kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET claim_expires = ? "
+                    "WHERE id = ? AND claim_lock IS ?",
+                    (grace, tid, row["claim_lock"]),
+                )
+            continue
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, last_heartbeat_at = NULL "
+                "WHERE id = ? AND claim_lock IS ? "
+                "  AND status NOT IN ('running', 'done', 'archived')",
+                (tid, row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                # Lost the CAS: another writer already handled this row.
+                # Do not close its run or emit a duplicate reclaimed event.
+                continue
+            run_id = _kb._current_run_id(conn, tid)
+            if run_id is not None:
+                _kb._end_run(
+                    conn, tid,
+                    outcome="reclaimed", status="reclaimed",
+                    error="stale claim on non-running task "
+                          f"(claim_lock={row['claim_lock']})",
+                    metadata=termination,
+                )
+            _kb._append_event(
+                conn, tid, "reclaimed",
+                {
+                    "reason": "stale_claim_on_non_running_task",
+                    "claim_lock": row["claim_lock"],
+                    "claim_expires": (
+                        int(claim_expires)
+                        if claim_expires is not None else None
+                    ),
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "now": now,
+                },
+                run_id=run_id,
+            )
+            reclaimed.append(tid)
+            _kb._log.info(
+                "kanban dispatch: cleared stale claim_lock=%r on non-running "
+                "task %s (status != running) — restoring spawnability",
+                row["claim_lock"], tid,
+            )
+    return reclaimed
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -1503,11 +2046,15 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    (PR URL in a recent comment; re-spawning risks a duplicate PR — released
+    when a handoff or explicit re-queue event followed the newest PR comment:
+    the named profile must work on that PR, or the card was deliberately
+    re-queued (#111910, #162/#163, t_ebaaee1c); or when EVERY PR linked in the
+    window is already merged/closed, probed fail-closed via
+    :mod:`hermes_cli.kanban_pr_state` on the hold path only — without network
+    proof the hold stands). The review lane skips the last two: they are the
+    *inputs* to a review handoff. Stale / dead claim locks are NOT a guard
+    reason — the reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1586,12 +2133,22 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    #    Release when EITHER:
+    #    (a) a handoff or explicit re-queue event arrives STRICTLY AFTER the
+    #        newest PR comment (operator reassign, reviewer changes_requested,
+    #        review reopen, or a deliberate re-queue: status/promoted/unblocked/
+    #        reclaimed) — a closer, an implementer finishing the PR, or a
+    #        "run it again" order, not a duplicate implementation (#111910;
+    #        re-queue release = #162/#163, t_ebaaee1c). A same-second tie
+    #        stays guarded (fail closed).
+    #    (b) EVERY PR linked in the window (across all comments, deduped) is
+    #        already merged/closed — nothing open is left to duplicate
+    #        (t_ebaaee1c R2). Probed via kanban_pr_state on THIS hold path
+    #        only (cards without PR comments never pay a probe), cached per
+    #        URL; any open or unknown PR keeps the hold (fail closed, R3).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    linked_prs: list[tuple[str, str, int]] = []
+    anchored = False
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
@@ -1600,18 +2157,34 @@ def check_respawn_guard(
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
+        linked_prs.extend(_pr_state.parse_pr_urls(body))
+        if anchored:
+            # Older comments only contribute URLs: the event anchor stays the
+            # newest PR comment (an event between two PR comments must not
+            # release a card that was re-commented afterwards).
+            continue
+        anchored = True
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+            # Kind list mirrors the handoff kinds plus
+            # _RESPAWN_GUARD_REQUEUE_KINDS (built once in the constants block).
+            f"SELECT kind, payload FROM task_events "
+            f"WHERE task_id = ? AND created_at > ? "
+            f"AND kind IN ({_RESPAWN_GUARD_RELEASE_KIND_SQL})",
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
-        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+        if any(
+            e["kind"] in _RESPAWN_GUARD_REQUEUE_KINDS
+            or _is_handoff_event(e["kind"], e["payload"])
+            for e in events
+        ):
             return None
-        return "active_pr"
-
-    return None
+    if not anchored:
+        return None
+    # Hold path: state release — every linked PR provably terminal.
+    if _pr_state.all_prs_terminal(linked_prs):
+        return None
+    return "active_pr"
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
@@ -1858,6 +2431,60 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         )
     except Exception:
         return 0
+
+
+def _live_running_rows(conn: sqlite3.Connection) -> list:
+    """``running`` cards with a live process behind them — the cap basis.
+
+    A row counts when its claim is fresh OR a live host-local worker backs it:
+    a worker that outlived its TTL must still hold its slot, else the cap would
+    spawn a duplicate beside it (t_61a60c56). Ghost rows — expired claim, dead
+    or absent worker — are excluded; the reclaim phase closes them earlier in
+    the same tick, this filter is the hard backstop (t_56037ffe: four ghost
+    rows held the board at 12-14 "running" against a cap of 8).
+    """
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT id, assignee, claim_expires, worker_pid, worker_started_at, claim_lock "
+        "FROM tasks WHERE status = 'running'"
+    ).fetchall()
+    host_prefix = _kb._host_prefix()
+    live = []
+    for row in rows:
+        expires = row["claim_expires"]
+        if expires is None or int(expires) >= now:
+            live.append(row)
+            continue
+        pid = row["worker_pid"]
+        if (pid
+                and str(row["claim_lock"] or "").startswith(host_prefix)
+                and _worker_alive(pid, row["worker_started_at"])):
+            live.append(row)
+    return live
+
+
+def count_live_running_tasks(conn: sqlite3.Connection) -> int:
+    """Number of ``running`` cards with a live process behind them.
+
+    Spawn-budget counterpart of :func:`count_running_tasks` (which stays for
+    the multi-board sweep): ghost rows — expired claim, dead/absent worker —
+    must not shrink the real spawn capacity.
+    """
+    return len(_live_running_rows(conn))
+
+
+def count_live_running_per_profile(conn: sqlite3.Connection) -> dict[str, int]:
+    """Per-assignee live running counts (successor of the raw profile SQL).
+
+    Same liveness predicate as :func:`count_live_running_tasks`: a ghost row on
+    an assignee's name otherwise presses that profile's cap (#21582).
+    """
+    counts: dict[str, int] = {}
+    for row in _live_running_rows(conn):
+        assignee = row["assignee"]
+        if assignee is not None:
+            counts[assignee] = counts.get(assignee, 0) + 1
+    return counts
 
 
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
@@ -2155,6 +2782,22 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    # Clear leaked claim locks stranded on non-running (todo/ready/review/
+    # scheduled/blocked) cards BEFORE the orphan-claim sweep below: a claim is
+    # a 'running'-phase artifact, a leftover lock on any other status makes the
+    # card unspawnable (the pickers require claim_lock IS NULL) yet invisible
+    # to release_stale_claims (which only scans 'running'). This pass either
+    # releases the lock (verified death) or extends it (live worker) so the
+    # liveness-blind orphan-claim sweep never clears a lock beside a live
+    # writer. See reclaim_stale_ready_claims.
+    result.stale_ready_reclaimed = reclaim_stale_ready_claims(conn)
+    # Ghost-run harvest (t_56037ffe): run rows whose card left 'running' are
+    # invisible to every sweep above (they all key on tasks.status='running') —
+    # close them and release the card-side claim remnants BEFORE the budget is
+    # counted and promotion re-opens lanes, so the same tick that reaps also
+    # unblocks the card.
+    result.reaped_orphan_runs = reap_orphaned_runs(conn)
+    result.released_orphan_claims = release_orphaned_task_claims(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2177,10 +2820,13 @@ def _tick_spawn_budget(
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
     # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
+    # Live count (t_56037ffe): ghost rows (expired claim, dead/absent worker)
+    # must not shrink the real budget; the reclaim phase closes them first,
+    # this liveness filter is the backstop.
     running_count = 0
     spawn_budget: Optional[int] = None
     if max_spawn is not None or max_in_progress is not None:
-        running_count = count_running_tasks(conn)
+        running_count = count_live_running_tasks(conn)
 
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
@@ -2327,12 +2973,9 @@ def _dispatch_once_locked(
     ) else None
     per_profile_running: dict[str, int] = {}
     if per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+        # Live counts (t_56037ffe): same liveness predicate as the spawn
+        # budget — a ghost row on an assignee's name must not press their cap.
+        per_profile_running = count_live_running_per_profile(conn)
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold

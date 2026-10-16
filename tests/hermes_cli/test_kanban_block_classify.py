@@ -37,7 +37,12 @@ def _time_out_once(conn, tid: str) -> None:
 def test_typed_block_classifies_untyped_breaker_block(kanban_home, monkeypatch):
     """Two timeouts trip the breaker untyped; the supervisor's typed block then
     attaches the kind without a status flap, a synthetic run, or lost evidence."""
+    # Verified-death simulation (worker AND group): the pytest process group is
+    # really alive, so the survivor guard would otherwise correctly HOLD the
+    # claim and the timeout premise never materialises.
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kbd, "_group_alive", lambda pid: False)
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="ceiling", assignee="worker", max_runtime_seconds=1)
         _time_out_once(conn, tid)
@@ -59,7 +64,10 @@ def test_typed_block_classifies_untyped_breaker_block(kanban_home, monkeypatch):
 
 
 def test_typed_block_still_refuses_typed_or_live_blocked_cards(kanban_home, monkeypatch):
+    # Verified-death simulation (worker AND group) — see the sibling test.
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kbd, "_group_alive", lambda pid: False)
     with kbc.connect() as conn:
         parked = kb.create_task(conn, title="parked", assignee="worker", max_runtime_seconds=1)
         _time_out_once(conn, parked)

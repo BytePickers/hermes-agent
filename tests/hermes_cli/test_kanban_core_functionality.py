@@ -263,10 +263,19 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
+    # We bypass the liveness probes by stubbing them so the grace-poll exits
+    # fast AND the release contract sees a verified death (worker AND group):
+    # the pytest process group is really alive, so the survivor guard would
+    # otherwise correctly HOLD the claim and this test's "termination
+    # succeeded" premise never materialises.
     import hermes_cli.kanban_db as _kb
+    import hermes_cli.kanban_db_dispatch as _kbd
     original_alive = _kb._pid_alive
+    original_kbd_alive = _kbd._pid_alive
+    original_group = _kbd._group_alive
     _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+    _kbd._pid_alive = lambda pid: False
+    _kbd._group_alive = lambda pid: False  # group verified dead as well
 
     try:
         conn = kbc.connect()
@@ -310,6 +319,8 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             conn.close()
     finally:
         _kb._pid_alive = original_alive
+        _kbd._pid_alive = original_kbd_alive
+        _kbd._group_alive = original_group
 
 
 
