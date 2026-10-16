@@ -863,7 +863,13 @@
           if (!donePageGateRef.current.accepts(token)) return;  // stale scope — no banner
           setError(String(err && err.message ? err.message : err));
         })
-        .finally(function () { setDoneLoading(false); });
+        .finally(function () {
+          // A stale request must not release the loading lock of the new
+          // scope: the reset effect cleared doneLoading on scope change and
+          // a fresh "Load more" may already hold it — releasing it here
+          // would allow two concurrent fetches for the same offset.
+          if (donePageGateRef.current.accepts(token)) setDoneLoading(false);
+        });
     }, [kanbanBoard, extraDone, doneLoading, tenantFilter, includeArchived, board]);
 
     // --- load list of boards for the switcher ------------------------------
@@ -1387,16 +1393,46 @@
         if (!r.confirmed) return null;
         const ids = Array.from(selectedIds);
         setSelectedIds(new Set());
-        return Promise.all(ids.map(function (id) {
+        // Partial success must still count: one failing DELETE must not
+        // abandon the ids that were actually deleted — they would linger
+        // in the held extra done pages as ghosts (and no refresh would
+        // clear them). Settle every delete, prune the successes, refresh,
+        // and surface the failures.
+        return Promise.allSettled(ids.map(function (id) {
           return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
-        })).then(function () {
-          // Deleted cards must also leave the held extra done pages (ghost
-          // guard, same as performMoveTask).
-          setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(ids)); });
-          loadBoard();
+        })).then(function (results) {
+          const deletedIds = [];
+          const failed = [];
+          results.forEach(function (res, i) {
+            if (res.status === "fulfilled") deletedIds.push(ids[i]);
+            else failed.push({ id: ids[i], error: res.reason });
+          });
+          if (deletedIds.length) {
+            setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(deletedIds)); });
+            loadBoard();
+          }
+          if (failed.length) {
+            const first = failed[0].error;
+            setError(String(first && first.message ? first.message : first));
+          }
         }).catch(function (e) { setError(String(e.message || e)); });
       }).catch(function () { /* cancelled */ });
     }, [selectedIds, board, loadBoard, t, kanbanDialogs]);
+
+    // A drawer patch that changes a task's status (complete / archive /
+    // unblock — every drawer status action rides one PATCH with a `status`
+    // key) can move a card out of the done column. Same ghost class as the
+    // move paths: the card may live only in a held extra page, so it must
+    // leave it — the merge would otherwise resurrect it after the refresh.
+    // Patches without a membership key (title, priority, assignee, …) keep
+    // the held page: the card stays done and must stay visible.
+    const handleDrawerTaskPatched = useCallback(function (taskId, patch) {
+      if (!patch) return;
+      const changesMembership = Object.prototype.hasOwnProperty.call(patch, "status")
+        || Object.prototype.hasOwnProperty.call(patch, "archived");
+      if (!changesMembership) return;
+      setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+    }, []);
 
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {
@@ -1508,6 +1544,7 @@
           onClose: function () { setSelectedTaskId(null); },
           onOpenTask: setSelectedTaskId,
           onRefresh: loadBoard,
+          onTaskPatched: handleDrawerTaskPatched,
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
           assignees: (boardData && boardData.assignees) || [],
@@ -1700,11 +1737,18 @@
 
   function DiagnosticCard(props) {
     const { t } = useI18n();
-    const { diag, task, boardSlug, assignees, onRefresh } = props;
+    const { diag, task, boardSlug, assignees, onRefresh, onTaskPatched } = props;
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState(null);
     const [copiedKey, setCopiedKey] = useState(null);
     const [reassignProfile, setReassignProfile] = useState(task.assignee || "");
+
+    // Unblock / reclaim / reassign all flip the task's status to `ready`
+    // server-side. If the card lived in a held extra done page, the parent
+    // must drop it there (ghost guard — same class as the drawer PATCH).
+    const noteStatusReady = function () {
+      if (onTaskPatched) onTaskPatched(task.id, { status: "ready" });
+    };
 
     const execAction = function (action) {
       if (busy) return;
@@ -1758,6 +1802,7 @@
           setMsg({ ok: true, text: tx(t, "unblockedMessage",
             "Unblocked {id}. Task is ready for the next tick.", { id: task.id }) });
           if (onRefresh) onRefresh();
+          noteStatusReady();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "unblockFailed", "Unblock failed: ") + (err.message || err) });
         }).then(function () { setBusy(false); });
@@ -1774,6 +1819,7 @@
           setMsg({ ok: true, text: tx(t, "reclaimedMessage",
             "Reclaimed {id}. Task is back to ready.", { id: task.id }) });
           if (onRefresh) onRefresh();
+          noteStatusReady();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "reclaimFailed", "Reclaim failed: ") + (err.message || err) });
         }).then(function () { setBusy(false); });
@@ -1802,6 +1848,7 @@
               { id: task.id, profile: reassignProfile }),
           });
           if (onRefresh) onRefresh();
+          noteStatusReady();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "reassignFailed", "Reassign failed: ") + (err.message || err) });
         }).then(function () { setBusy(false); });
@@ -1929,6 +1976,7 @@
                 boardSlug: props.boardSlug,
                 assignees: props.assignees,
                 onRefresh: props.onRefresh,
+                onTaskPatched: props.onTaskPatched,
               });
             }),
           )
@@ -3830,7 +3878,14 @@
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(finalPatch),
-        }).then(function () { load(); props.onRefresh(); })
+        }).then(function () {
+          load();
+          props.onRefresh();
+          // A status/archived patch can move the card out of the done
+          // column — the parent must drop it from the held extra pages
+          // (ghost guard, same class as the move paths).
+          if (props.onTaskPatched) props.onTaskPatched(props.taskId, finalPatch);
+        })
           .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); });
       }
     };
@@ -3988,6 +4043,7 @@
           onPatch: doPatch,
           onSpecify: doSpecify,
           onDecompose: doDecompose,
+          onTaskPatched: props.onTaskPatched,
           onAddParent: addLink,
           onRemoveParent: removeLink,
           onAddChild: addChild,
@@ -4216,6 +4272,7 @@
         assignees: props.assignees,
         diagnostics: t.diagnostics || [],
         onRefresh: props.onRefresh,
+        onTaskPatched: props.onTaskPatched,
       }),
       h(HomeSubsSection, {
         homeChannels: props.homeChannels || [],
@@ -5085,6 +5142,11 @@
       pruneExtraDoneTasks: pruneExtraDoneTasks,
       withOptimisticMove: withOptimisticMove,
       createDonePageGate: createDonePageGate,
+      // Real drawer component — the lifecycle harness drives it directly
+      // (props-level observation cannot reach doPatch, which is internal).
+      TaskDrawer: TaskDrawer,
+      DiagnosticsSection: DiagnosticsSection,
+      DiagnosticCard: DiagnosticCard,
     };
   }
 })();

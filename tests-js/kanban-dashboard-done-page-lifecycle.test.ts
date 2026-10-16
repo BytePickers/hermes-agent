@@ -168,6 +168,9 @@ function createServer() {
     ['d2', doneTask('d2', 200)], // lives on done page 2 (limit-1 window)
   ])
 
+  // DELETE ids that fail (partial-failure emulation for bulk delete).
+  const deleteFailures = new Set<string>()
+
   const LIMIT = 1
 
   const doneSorted = () =>
@@ -245,6 +248,30 @@ function createServer() {
 
     const patchMatch = url.match(/\/tasks\/([^/?]+)/)
 
+    // Task detail (drawer load): GET /tasks/<id>
+    if (patchMatch && (!opts || !opts.method)) {
+      const t = tasks.get(decodeURIComponent(patchMatch[1]))
+
+      return Promise.resolve({
+        task: t ? { ...t } : null,
+        comments: [],
+        events: [],
+        attachments: [],
+        links: { parents: [], children: [] },
+        child_results: [],
+      })
+    }
+
+    // Reclaim / reassign flip the task's status to ready (server truth).
+    if (patchMatch && opts && opts.method === 'POST'
+      && (url.includes('/reclaim') || url.includes('/reassign'))) {
+      const t = tasks.get(decodeURIComponent(patchMatch[1]))
+
+      if (t) { t.status = 'ready' }
+
+      return Promise.resolve({})
+    }
+
     if (patchMatch && opts && opts.method === 'PATCH') {
       const t = tasks.get(decodeURIComponent(patchMatch[1]))
       const body = JSON.parse((opts && opts.body) || '{}')
@@ -255,7 +282,11 @@ function createServer() {
     }
 
     if (patchMatch && opts && opts.method === 'DELETE') {
-      tasks.delete(decodeURIComponent(patchMatch[1]))
+      const id = decodeURIComponent(patchMatch[1])
+
+      if (deleteFailures.has(id)) { return Promise.reject(new Error(`delete failed: ${id}`)) }
+
+      tasks.delete(id)
 
       return Promise.resolve({})
     }
@@ -269,6 +300,7 @@ function createServer() {
   return {
     route,
     setDeferLoadMore(v: boolean) { deferMode = v },
+    setDeleteFailures(ids: string[]) { for (const id of ids) { deleteFailures.add(id) } },
     releaseDeferred(filter: string): number {
       let n = 0
 
@@ -277,6 +309,17 @@ function createServer() {
       }
 
       return n
+    },
+    // Releases exactly the OLDEST parked response (FIFO) — lets a test
+    // resolve a specific in-flight request without releasing later ones.
+    releaseFirstDeferred(): number {
+      const d = deferred.shift()
+
+      if (!d) { return 0 }
+
+      d.resolve(d.payload)
+
+      return 1
     },
     serverDoneIds(): string[] { return doneSorted().map((t) => t.id) },
     setTaskStatus(id: string, status: string) {
@@ -306,11 +349,11 @@ function walk(node: unknown, visit: (n: VNode) => void): void {
   walk(n.children, visit)
 }
 
-function mount(server: ReturnType<typeof createServer>) {
-  const runtime = createHooksRuntime()
-  const registered: Array<[string, any]> = []
-  const calls: Array<{ url: string; opts: any }> = []
-
+// Shared browser/window stub: one SDK + globals per harness instance. Every
+// harness evaluates the real plugin IIFE against its OWN window/hooks runtime,
+// so each mounted component gets an isolated hook-slot space (the same trick
+// real React plays per root).
+function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: ReturnType<typeof createServer>, calls: Array<{ url: string; opts: any }>) {
   const win: Record<string, unknown> = {
     __HERMES_PLUGIN_SDK__: {
       React: runtime.React,
@@ -335,7 +378,7 @@ function mount(server: ReturnType<typeof createServer>) {
       buildWsUrl: () => new Promise(() => {}),
     },
     __HERMES_PLUGINS__: {
-      register: (name: string, page: any) => { registered.push([name, page]) },
+      register: (name: string, page: any) => { /* per-harness capture not needed here */ },
     },
     __HERMES_KANBAN_TEST__: true,
     localStorage: {
@@ -343,10 +386,31 @@ function mount(server: ReturnType<typeof createServer>) {
       setItem: () => { /* ignore */ },
       removeItem: () => { /* ignore */ },
     },
+    // TaskDrawer registers an Escape-key listener on mount.
+    addEventListener: () => {},
+    removeEventListener: () => {},
   }
 
   ;(globalThis as unknown as { window: unknown }).window = win
+
+  return win
+}
+
+function evalPlugin(): void {
   vm.runInThisContext(readFileSync(PLUGIN_PATH, 'utf8'), { filename: PLUGIN_PATH })
+}
+
+function mount(server: ReturnType<typeof createServer>) {
+  const runtime = createHooksRuntime()
+  const registered: Array<[string, any]> = []
+  const calls: Array<{ url: string; opts: any }> = []
+
+  const win = createWindow(runtime, server, calls) as Record<string, any>
+  win.__HERMES_PLUGINS__ = {
+    register: (name: string, page: any) => { registered.push([name, page]) },
+  }
+
+  evalPlugin()
 
   const KanbanPage = registered[0][1]
 
@@ -415,6 +479,7 @@ function mount(server: ReturnType<typeof createServer>) {
     unmount: runtime.unmount,
     boardColumnsProps: () => findProps('BoardColumns'),
     dialogsProps: () => findProps('KanbanDialogs'),
+    taskDrawerProps: () => findProps('TaskDrawer'),
     nodeWithProp,
     doneIds,
     todoIds,
@@ -422,6 +487,132 @@ function mount(server: ReturnType<typeof createServer>) {
     calls,
     callsTo,
   }
+}
+
+// Harness for the REAL TaskDrawer: mounts the drawer component directly
+// (its own hooks runtime + own IIFE evaluation), lets it load its task
+// detail, and exposes the drawer's rendered subtree — doPatch itself is
+// reachable as TaskDetail's `onPatch` prop, exactly as the drawer wires it.
+function mountDrawer(server: ReturnType<typeof createServer>, drawerProps: Record<string, any>) {
+  const runtime = createHooksRuntime()
+  const calls: Array<{ url: string; opts: any }> = []
+
+  createWindow(runtime, server, calls)
+  evalPlugin()
+
+  const TaskDrawer = (globalThis as unknown as { window: Record<string, any> }).window
+    .__HERMES_KANBAN_TEST_HELPERS__.TaskDrawer as (props: Record<string, any>) => VNode
+
+  const props = {
+    renderMarkdown: () => '',
+    allTasks: [],
+    assignees: [],
+    eventTick: 0,
+    onClose: () => {},
+    onOpenTask: () => {},
+    onRefresh: () => {},
+    ...drawerProps,
+  }
+
+  let tree: VNode | null = null
+
+  const render = () => {
+    runtime.beginRender()
+    tree = TaskDrawer(props) as unknown as VNode
+  }
+
+  render()
+
+  const tick = () => new Promise((r) => setImmediate(r))
+
+  const flush = async (rounds = 30): Promise<void> => {
+    for (let i = 0; i < rounds; i++) {
+      await tick()
+
+      if (runtime.takeDirty()) { render() }
+      runtime.runEffectsPass()
+    }
+  }
+
+  const detailProps = (): Record<string, any> => {
+    let found: Record<string, any> | null = null
+
+    walk(tree, (n) => {
+      if (!found && typeof n.type === 'function' && n.type.name === 'TaskDetail') { found = n.props }
+    })
+
+    if (!found) { throw new Error('TaskDetail element not found — drawer did not load its task detail') }
+
+    return found
+  }
+
+  return { flush, detailProps, calls, callsTo: (fragment: string) => calls.filter((c) => c.url.includes(fragment)) }
+}
+
+// Harness for the REAL diagnostics chain: mounts DiagnosticsSection and — in
+// the same pass, in stable tree order — invokes its DiagnosticCard children
+// (the same invocation order every pass keeps the hook-slot space consistent,
+// mirroring how React walks the tree). The action button's real onClick is
+// then reachable through the rendered subtree.
+function mountDiagSection(server: ReturnType<typeof createServer>, sectionProps: Record<string, any>) {
+  const runtime = createHooksRuntime()
+  const calls: Array<{ url: string; opts: any }> = []
+
+  createWindow(runtime, server, calls)
+  evalPlugin()
+
+  const helpers = (globalThis as unknown as { window: Record<string, any> }).window
+    .__HERMES_KANBAN_TEST_HELPERS__
+
+  const props = { task: sectionProps.task, ...sectionProps }
+
+  let tree: VNode | null = null
+
+  const render = () => {
+    runtime.beginRender()
+    tree = helpers.DiagnosticsSection(props) as unknown as VNode
+    // Invoke the real DiagnosticCard elements in stable tree order.
+    walk(tree, (n) => {
+      if (typeof n.type === 'function' && n.type.name === 'DiagnosticCard') {
+        n.children = [(n.type as any)(n.props)]
+      }
+    })
+  }
+
+  render()
+
+  const tick = () => new Promise((r) => setImmediate(r))
+
+  const flush = async (rounds = 30): Promise<void> => {
+    for (let i = 0; i < rounds; i++) {
+      await tick()
+
+      if (runtime.takeDirty()) { render() }
+      runtime.runEffectsPass()
+    }
+  }
+
+  // Clicks the real action for the given kind: DiagnosticActionButton's
+  // onClick is exactly `onExec(action)` — invoked here against the real
+  // execAction closure the DiagnosticCard wired in.
+  const clickAction = (kind: string): void => {
+    let clicked = false
+
+    walk(tree, (n) => {
+      if (clicked) { return }
+
+      if (typeof n.type === 'function' && n.type.name === 'DiagnosticActionButton'
+        && n.props.action && n.props.action.kind === kind
+        && typeof n.props.onExec === 'function') {
+        n.props.onExec(n.props.action)
+        clicked = true
+      }
+    })
+
+    if (!clicked) { throw new Error(`no rendered action button for kind ${kind}`) }
+  }
+
+  return { flush, clickAction, calls, callsTo: (fragment: string) => calls.filter((c) => c.url.includes(fragment)) }
 }
 
 describe('kanban dashboard done-page lifecycle (component harness)', () => {
@@ -547,6 +738,174 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     await h.flush()
     // Without the gate the stale page-2 card would appear here as a ghost.
     expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('drawer status patch of an extra-page card reaches the parent prune hook with the final patch', async () => {
+    const server = createServer()
+    const patched: Array<[string, any]> = []
+
+    const h = mountDrawer(server, {
+      taskId: 'd2',
+      boardSlug: 'default',
+      onTaskPatched: (taskId: string, patch: any) => { patched.push([taskId, patch]) },
+    })
+
+    await h.flush()
+
+    // The drawer loaded its detail; doPatch is reachable as TaskDetail's
+    // onPatch prop — exactly how StatusActions/TaskDetail call it.
+    const detail = h.detailProps()
+    expect(typeof detail.onPatch).toBe('function')
+
+    detail.onPatch({ status: 'todo' })
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    expect(JSON.parse(patch!.opts.body)).toEqual({ status: 'todo' })
+    // The parent is told WHICH task changed and HOW — it prunes extraDone.
+    expect(patched).toEqual([['d2', { status: 'todo' }]])
+  })
+
+  it('drawer reports every applied patch to the parent; the parent decides membership', async () => {
+    const server = createServer()
+    const patched: Array<[string, any]> = []
+
+    const h = mountDrawer(server, {
+      taskId: 'd2',
+      boardSlug: 'default',
+      onTaskPatched: (taskId: string, patch: any) => { patched.push([taskId, patch]) },
+    })
+
+    await h.flush()
+
+    // The drawer does not know about done paging — it forwards WHAT was
+    // patched and the parent (owner of the held extra pages) applies the
+    // membership rule (prune on status/archived, keep otherwise).
+    h.detailProps().onPatch({ priority: 3 })
+    await h.flush()
+
+    expect(h.callsTo('/tasks/d2').some((c) => (c.opts && c.opts.method) === 'PATCH')).toBe(true)
+    expect(patched).toEqual([['d2', { priority: 3 }]])
+  })
+
+  it('drawer unblock action reports the status flip to the parent (extra-page ghost guard)', async () => {
+    const server = createServer()
+    const patched: Array<[string, any]> = []
+    const task = { ...doneTask('d1', 300), diagnostics: [{ kind: 'worker_stalled', severity: 'error', title: 'stalled', detail: 'stalled', actions: [{ kind: 'unblock', label: 'Unblock' }] }] }
+
+    const h = mountDiagSection(server, {
+      task,
+      boardSlug: 'default',
+      assignees: [],
+      diagnostics: task.diagnostics,
+      onRefresh: () => {},
+      onTaskPatched: (taskId: string, patch: any) => { patched.push([taskId, patch]) },
+    })
+
+    await h.flush()
+
+    h.clickAction('unblock')
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d1').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    expect(JSON.parse(patch!.opts.body)).toEqual({ status: 'ready' })
+    expect(patched).toEqual([['d1', { status: 'ready' }]])
+  })
+
+  it('parent prune hook: membership-changing drawer patch removes the extra-page card, non-membership patch keeps it', async () => {
+    const server = createServer()
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Open the drawer for the extra-page card — the render site must wire
+    // the prune hook through.
+    h.boardColumnsProps().onOpen('d2')
+    await h.flush()
+    const drawer = h.taskDrawerProps()
+    expect(typeof drawer.onTaskPatched).toBe('function')
+
+    // A status patch on the extra-page card drops it from the merged done
+    // column immediately (no ghost), without touching the first page.
+    drawer.onTaskPatched('d2', { status: 'todo' })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // A non-membership patch must NOT prune — the card stays visible.
+    drawer.onTaskPatched('d1', { priority: 5 })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('bulk delete with one failing delete prunes the deleted ids and refreshes (no ghost)', async () => {
+    const server = createServer()
+    server.setDeleteFailures(['d2'])
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Select both done cards, bulk-delete them; d2's DELETE fails.
+    h.boardColumnsProps().toggleSelected('d1')
+    await h.flush()
+    h.boardColumnsProps().toggleSelected('d2', true)
+    await h.flush()
+    h.nodeWithProp('onDelete').onDelete(2)
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+
+    // Both DELETEs were attempted; d1's success still counts: pruned from
+    // the held pages AND the board refreshed — d2 (still on the server) is
+    // served by the refresh, d1 is not resurrected as a ghost.
+    expect(h.callsTo('/tasks/d1').some((c) => (c.opts && c.opts.method) === 'DELETE')).toBe(true)
+    expect(h.callsTo('/tasks/d2').some((c) => (c.opts && c.opts.method) === 'DELETE')).toBe(true)
+    expect(h.doneIds()).toEqual(['d2'])
+    h.unmount()
+  })
+
+  it('a stale load-more must not release the new scope\u2019s loading lock (no double fetch)', async () => {
+    const server = createServer()
+    server.setDeferLoadMore(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Start a load-more in the old scope; its response is parked.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // Scope switch: gate resets and the loading lock is cleared.
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+
+    // A fresh load-more in the new scope takes the lock again.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // The STALE response lands now. Its .finally must NOT release the lock
+    // — otherwise two load-more fetches could run for the same offset.
+    server.releaseFirstDeferred()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // The current request's response applies and releases the lock.
+    server.releaseDeferred('done_offset')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
     h.unmount()
   })
 })
