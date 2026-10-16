@@ -757,6 +757,13 @@
     // the component keeps seeing one complete done column.
     const [extraDone, setExtraDone] = useState([]);
     const [doneLoading, setDoneLoading] = useState(false);
+    // Number of membership writes (moves / bulk status patches) currently in
+    // flight. Pagination stays blocked while this is > 0: a "Load more"
+    // dispatched inside the pre-commit window reads the OLD done_pagination
+    // total (the server still holds the card being moved) and its response —
+    // built from pre-write server state — would otherwise attach the moved
+    // card back as a ghost. Released in the write's .finally.
+    const doneWritesRef = useRef(0);
     // In-flight "Load more" requests are token-gated: a page fetched before
     // a scope switch must not be applied to the new scope (see gate below).
     const donePageGateRef = useRef(null);
@@ -850,7 +857,10 @@
     // last one ended (small overlaps from concurrent completions are removed
     // by the merge).
     const loadMoreDone = useCallback(function () {
-      if (!kanbanBoard || doneLoading) return Promise.resolve();
+      // Blocked while a membership write is in flight: the pre-commit window
+      // (dispatch → write settles) has no valid done_pagination to page on —
+      // the server still serves the card being moved at the old total.
+      if (!kanbanBoard || doneLoading || doneWritesRef.current > 0) return Promise.resolve();
       const pagination = kanbanBoard.done_pagination || null;
       const mergedNow = withMergedDoneColumn(kanbanBoard, extraDone).columns
         .find(function (c) { return c.name === "done"; });
@@ -958,6 +968,17 @@
               const msg = JSON.parse(ev.data);
               if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
                 cursorRef.current = msg.cursor || cursorRef.current;
+                // Status events change board membership server-side (a task
+                // enters or leaves the done column). A "Load more" response
+                // built before the change would attach its pre-event page
+                // after the refresh — discard it immediately, before the
+                // debounced reload. Non-membership events (edited, comment,
+                // …) leave in-flight pagination alone.
+                let membershipChanged = false;
+                for (const e of msg.events) {
+                  if (e && e.kind === "status") { membershipChanged = true; break; }
+                }
+                if (membershipChanged) invalidateDonePageFetches();
                 // Stamp per-task signal so the TaskDrawer can reload itself.
                 setTaskEventTick(function (prev) {
                   const next = Object.assign({}, prev);
@@ -995,7 +1016,7 @@
         wsClosedRef.current = true;
         try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
       };
-    }, [!!boardData, board, scheduleReload]);
+    }, [!!boardData, board, scheduleReload, invalidateDonePageFetches]);
 
     // --- filtering ----------------------------------------------------------
     const filteredBoard = useMemo(function () {
@@ -1045,6 +1066,11 @@
         // held extras, or the merge resurrects them as ghosts.
         setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, selectedIds); });
         invalidateDonePageFetches();
+        // Pagination stays blocked until the write settles (doneWritesRef):
+        // a "Load more" dispatched in the pre-commit window reads the old
+        // done_pagination total — the server still holds these cards in done
+        // — and would attach them back after the move.
+        doneWritesRef.current += 1;
         setBoardData(function (b) { return withOptimisticMove(b, selectedIds, newStatus, extraDone); });
         const ids = Array.from(selectedIds);
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
@@ -1052,6 +1078,13 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(Object.assign({ ids: ids }, finalPatch)),
         }).then(function (res) {
+          const okIds = (res.results || []).filter(function (r) { return r.ok; }).map(function (r) { return r.id; });
+          if (okIds.length > 0) {
+            // Successfully written ids have left done server-side — keep the
+            // held extra pages free of them (belt and braces beside the
+            // dispatch-time prune above).
+            setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(okIds)); });
+          }
           const failed = (res.results || []).filter(function (r) { return !r.ok; });
           if (failed.length > 0) {
             setError(`Bulk move: ${failed.length} of ${res.results.length} failed`);
@@ -1066,20 +1099,36 @@
           setError(`Move failed: ${err.message || err}`);
           setFailedIds(new Set(selectedIds));
           loadBoard();
+        }).finally(function () {
+          // Post-commit invalidation: re-bump the gate (nothing can be in
+          // flight — pagination was blocked for the whole window) and
+          // release the loading lock.
+          doneWritesRef.current -= 1;
+          invalidateDonePageFetches();
         });
         return;
       }
       // Single-task path.
       setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
       invalidateDonePageFetches();
+      doneWritesRef.current += 1;
       setBoardData(function (b) { return withOptimisticMove(b, new Set([taskId]), newStatus, extraDone); });
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(finalPatch),
+      }).then(function () {
+        // The card has left done server-side — keep it out of the held extra
+        // pages (belt and braces beside the dispatch-time prune above).
+        setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
       }).catch(function (err) {
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         loadBoard();
+      }).finally(function () {
+        // Post-commit invalidation: re-bump the gate and release the loading
+        // lock — pagination is usable again only after the write settled.
+        doneWritesRef.current -= 1;
+        invalidateDonePageFetches();
       });
     }, [loadBoard, board, t, selectedIds, extraDone, invalidateDonePageFetches]);
 
@@ -1268,13 +1317,20 @@
       const run = function () {
         const finalPatch = patch;
         const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
-        // Optimistic UI for status moves (same pattern as moveSelected).
-        if (finalPatch.status) {
-          // Same ghost-card guard as performMoveTask: moved cards must also
-          // leave the held extra done pages.
+        // Status AND archive:true change done membership server-side (an
+        // archived done card leaves the column, plugin_api bulk handler
+        // archive_task) — same ghost-card guard as performMoveTask: the
+        // moved cards must also leave the held extra done pages.
+        const changesDoneMembership = !!finalPatch.status || finalPatch.archive === true;
+        if (changesDoneMembership) {
           setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, selectedIds); });
           invalidateDonePageFetches();
-          setBoardData(function (b) { return withOptimisticMove(b, selectedIds, finalPatch.status, extraDone); });
+          // Pagination stays blocked until the write settles (doneWritesRef),
+          // same pre-commit-window guard as performMoveTask.
+          doneWritesRef.current += 1;
+          if (finalPatch.status) {
+            setBoardData(function (b) { return withOptimisticMove(b, selectedIds, finalPatch.status, extraDone); });
+          }
         }
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
           method: "POST",
@@ -1282,6 +1338,15 @@
           body: JSON.stringify(body),
         })
           .then(function (res) {
+            if (changesDoneMembership) {
+              const okIds = (res.results || []).filter(function (r) { return r.ok; }).map(function (r) { return r.id; });
+              if (okIds.length > 0) {
+                // Successfully written ids have left done server-side — keep
+                // the held extra pages free of them (same belt-and-braces
+                // prune as performMoveTask).
+                setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(okIds)); });
+              }
+            }
             const failed = (res.results || []).filter(function (r) { return !r.ok; });
             if (failed.length > 0) {
               setError(tx(t, "bulkFailed", "Bulk: ") +
@@ -1299,6 +1364,14 @@
             setError(String(e.message || e));
             setFailedIds(new Set(selectedIds));
             loadBoard();
+          })
+          .finally(function () {
+            // Post-commit invalidation — mirrors performMoveTask: only when
+            // the write settled is pagination unblocked and the lock released.
+            if (changesDoneMembership) {
+              doneWritesRef.current -= 1;
+              invalidateDonePageFetches();
+            }
           });
       };
       if (!confirmMsg) {

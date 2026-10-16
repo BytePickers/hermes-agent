@@ -242,6 +242,12 @@ function createServer(extraTasks: any[] = []) {
         const t = tasks.get(id)
 
         if (t && body.status) { t.status = body.status }
+
+        if (t && body.archive) { t.status = 'archived' }
+      }
+
+      if (deferredWritesEnabled()) {
+        return new Promise((resolve) => { deferred.push({ url, payload: { results: (body.ids || []).map((id: string) => ({ id, ok: true })) }, resolve }) })
       }
 
       return Promise.resolve({ results: (body.ids || []).map((id: string) => ({ id, ok: true })) })
@@ -279,6 +285,10 @@ function createServer(extraTasks: any[] = []) {
 
       if (t && body.status) { t.status = body.status }
 
+      if (deferredWritesEnabled()) {
+        return new Promise((resolve) => { deferred.push({ url, payload: {}, resolve }) })
+      }
+
       return Promise.resolve({})
     }
 
@@ -297,10 +307,16 @@ function createServer(extraTasks: any[] = []) {
 
   let deferMode = false
   const deferredEnabled = () => deferMode
+  let deferWriteMode = false
+  const deferredWritesEnabled = () => deferWriteMode
 
   return {
     route,
     setDeferLoadMore(v: boolean) { deferMode = v },
+    // Parks WRITE responses (PATCH/bulk) like setDeferLoadMore parks pages:
+    // the test holds a membership write in flight to pin down the pre-commit
+    // window of the optimistic move paths.
+    setDeferWrites(v: boolean) { deferWriteMode = v },
     setDeleteFailures(ids: string[]) { for (const id of ids) { deleteFailures.add(id) } },
     releaseDeferred(filter: string): number {
       let n = 0
@@ -354,7 +370,30 @@ function walk(node: unknown, visit: (n: VNode) => void): void {
 // harness evaluates the real plugin IIFE against its OWN window/hooks runtime,
 // so each mounted component gets an isolated hook-slot space (the same trick
 // real React plays per root).
-function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: ReturnType<typeof createServer>, calls: Array<{ url: string; opts: any }>) {
+// opts.ws: install a WebSocket stub and let buildWsUrl resolve — lets a test
+// drive the plugin's real ws.onmessage handler (captured instances are
+// returned via the mount handle).
+function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: ReturnType<typeof createServer>, calls: Array<{ url: string; opts: any }>, opts: { ws?: boolean } = {}) {
+  const wsInstances: Array<Record<string, any>> = []
+
+  if (opts.ws) {
+    class FakeWebSocket {
+      url: string
+      onopen: (() => void) | null = null
+      onmessage: ((ev: { data: string }) => void) | null = null
+      onclose: ((ev: { code?: number }) => void) | null = null
+
+      constructor(url: string) {
+        this.url = url
+        wsInstances.push(this)
+      }
+
+      close() { /* noop */ }
+    }
+
+    ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeWebSocket
+  }
+
   const win: Record<string, unknown> = {
     __HERMES_PLUGIN_SDK__: {
       React: runtime.React,
@@ -375,8 +414,10 @@ function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: Re
 
         return server.route(url, opts)
       },
-      // Never settles: no WebSocket loop in tests.
-      buildWsUrl: () => new Promise(() => {}),
+      // Never settles: no WebSocket loop in tests (unless opts.ws).
+      buildWsUrl: opts.ws
+        ? () => Promise.resolve('ws://test/events')
+        : () => new Promise(() => {}),
     },
     __HERMES_PLUGINS__: {
       register: (name: string, page: any) => { /* per-harness capture not needed here */ },
@@ -398,19 +439,19 @@ function createWindow(runtime: ReturnType<typeof createHooksRuntime>, server: Re
 
   ;(globalThis as unknown as { window: unknown }).window = win
 
-  return win
+  return { win, wsInstances }
 }
 
 function evalPlugin(): void {
   vm.runInThisContext(readFileSync(PLUGIN_PATH, 'utf8'), { filename: PLUGIN_PATH })
 }
 
-function mount(server: ReturnType<typeof createServer>) {
+function mount(server: ReturnType<typeof createServer>, opts: { ws?: boolean } = {}) {
   const runtime = createHooksRuntime()
   const registered: Array<[string, any]> = []
   const calls: Array<{ url: string; opts: any }> = []
 
-  const win = createWindow(runtime, server, calls) as Record<string, any>
+  const { win, wsInstances } = createWindow(runtime, server, calls, opts) as { win: Record<string, any>; wsInstances: Array<Record<string, any>> }
   win.__HERMES_PLUGINS__ = {
     register: (name: string, page: any) => { registered.push([name, page]) },
   }
@@ -489,6 +530,7 @@ function mount(server: ReturnType<typeof createServer>) {
     doneIds,
     todoIds,
     donePaging,
+    wsInstances,
     calls,
     callsTo,
   }
@@ -984,6 +1026,156 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     expect(h.boardColumnsProps().doneLoading).toBe(true)
 
     // The current request's response applies and releases the lock.
+    server.releaseDeferred('done_offset')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+    h.unmount()
+  })
+
+  it('load-more is blocked while a move write is in flight; usable again after it settles', async () => {
+    const server = createServer()
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Move d2 out of done — the PATCH write is parked, so the component sits
+    // in the pre-commit window: dispatch-time prune+invalidation happened,
+    // but the server still holds d2 in done at the OLD done_pagination total.
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+    const offsetCallsBefore = h.callsTo('done_offset').length
+
+    // A "Load more" dispatched inside the window must be a no-op — its page
+    // would be built from pre-write server state and ghost d2 back in.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore)
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // The write settles: pagination unblocks (post-commit invalidation) and
+    // a fresh load-more is served from post-move server truth — no ghost.
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore + 1)
+    expect(h.doneIds()).toEqual(['d1'])
+    expect(h.todoIds()).toContain('d2')
+    h.unmount()
+  })
+
+  it('applyBulk status patch blocks load-more until the write settles too', async () => {
+    // Seed card: three done cards total, so a deeper page still exists after
+    // the bulk write moved d0 out of done.
+    const server = createServer([doneTask('d0', 400)])
+    server.setDeferWrites(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    h.boardColumnsProps().toggleSelected('d0')
+    await h.flush()
+    // BulkActionBar apply — the applyBulk path (status patch without the
+    // move dialogs). The write is parked: pre-commit window.
+    h.nodeWithProp('onApply').onApply({ status: 'todo' })
+    await h.flush()
+    const offsetCallsBefore = h.callsTo('done_offset').length
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore)
+
+    server.releaseDeferred('/tasks/bulk')
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.callsTo('done_offset').length).toBe(offsetCallsBefore + 1)
+    // Fresh page from post-write server truth — no d0 ghost anywhere.
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    expect(h.todoIds()).toContain('d0')
+    h.unmount()
+  })
+
+  it('bulk archive of an extra-page done card removes it from the held extra pages (no ghost)', async () => {
+    const server = createServer()
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // archive:true changes done membership server-side exactly like a status
+    // move (bulk handler archive_task) — the same ghost guard must apply.
+    h.boardColumnsProps().toggleSelected('d2')
+    await h.flush()
+    h.nodeWithProp('onApply').onApply({ archive: true })
+    await h.flush()
+
+    expect(h.doneIds()).toEqual(['d1'])
+    const bulk = h.callsTo('/tasks/bulk')[0]
+    expect(bulk).toBeTruthy()
+    expect(JSON.parse(bulk!.opts.body).archive).toBe(true)
+    h.unmount()
+  })
+
+  it('a WS status event invalidates an in-flight load-more (no ghost after the refresh)', async () => {
+    const server = createServer()
+    server.setDeferLoadMore(true)
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Load-more in flight; its page is built from PRE-event server state and
+    // parked ([d2] at offset 1).
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // Server-side membership changes and the status event arrives over the
+    // real WS handler while the page is still parked.
+    const ws = h.wsInstances[0]
+    expect(ws).toBeTruthy()
+
+    if (ws.onopen) { ws.onopen() }
+    server.setTaskStatus('d2', 'todo')
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'status' }], cursor: 2 }) })
+    await h.flush()
+
+    // The event released the loading lock immediately (the stale request's
+    // .finally can no longer release it once invalidated).
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+
+    // The parked pre-event page lands — it must be discarded: d2 left done
+    // server-side and would come back as a ghost into the merged column.
+    server.releaseDeferred('done_offset')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a non-membership WS event does not invalidate an in-flight load-more', async () => {
+    const server = createServer()
+    server.setDeferLoadMore(true)
+    const h = mount(server, { ws: true })
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // An 'edited' event does not change board membership — the in-flight
+    // page stays valid and must still apply.
+    const ws = h.wsInstances[0]
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd1', kind: 'edited' }], cursor: 3 }) })
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
     server.releaseDeferred('done_offset')
     await h.flush()
     expect(h.doneIds()).toEqual(['d1', 'd2'])
