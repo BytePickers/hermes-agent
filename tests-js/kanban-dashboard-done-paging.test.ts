@@ -66,6 +66,7 @@ describe('kanban dashboard done-column paging', () => {
     donePagingState: (pagination: unknown, merged: unknown[]) => { total: number; loaded: number; hasMore: boolean }
     withMergedDoneColumn: (board: unknown, extra: unknown[]) => { columns: Array<{ name: string; tasks: Array<{ id: string }> }> } & Record<string, unknown>
     pruneExtraDoneTasks: (extra: unknown, ids: Set<string>) => Array<{ id: string }>
+    doneWindowKey: (board: string | null | undefined, taskId: string) => string
     withOptimisticMove: (board: any, ids: Set<string>, newStatus: string, extraDone: any[]) => any
     createFetchGate: () => {
       current: () => number
@@ -152,6 +153,18 @@ describe('kanban dashboard done-column paging', () => {
     // Entries without an id survive (defensive: merge ignores them too).
     expect(helpers.pruneExtraDoneTasks([{ noId: true } as { id?: string }], new Set(['d1'])))
       .toEqual([{ noId: true }])
+  })
+
+  it('doneWindowKey scopes window counters per board so cross-board id collisions never meet', () => {
+    // Task ids are unique only within one board's db (one kanban_db file per
+    // board) — the key must carry the board so board A's late delete success
+    // can never close board B's restore window for a colliding id.
+    expect(helpers.doneWindowKey('default', 'd2')).toBe('default:d2')
+    expect(helpers.doneWindowKey('board-b', 'd2')).toBe('board-b:d2')
+    expect(helpers.doneWindowKey('default', 'd2')).not.toBe(helpers.doneWindowKey('board-b', 'd2'))
+    // Missing board slug (never expected at runtime) still keys per taskId.
+    expect(helpers.doneWindowKey(null, 'd2')).toBe(':d2')
+    expect(helpers.doneWindowKey(undefined, 'd2')).toBe(':d2')
   })
 
   it('withOptimisticMove moves raw-column and extra-page cards into the destination', () => {

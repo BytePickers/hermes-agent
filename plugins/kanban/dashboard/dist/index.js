@@ -162,6 +162,18 @@
     return pages;
   }
 
+  // Window-counter key for the per-id done-window guards (WS membership
+  // events, successful local deletes). Task ids are only unique WITHIN one
+  // board's DB — each board has its own kanban_db file, so ids can collide
+  // ACROSS boards. A counter keyed by the raw id alone would let a late
+  // success from board A's in-flight write leak into board B's restore
+  // window and suppress a legitimate restore of board B's same-id card.
+  // Keying by board + id keeps every window comparison inside the board it
+  // was opened for. Pure; tested.
+  function doneWindowKey(board, taskId) {
+    return (board || "") + ":" + taskId;
+  }
+
   // Ids of a board payload's done column, in server order (or null when the
   // payload has no done column). Pure; tested.
   function doneColumnIds(board) {
@@ -1050,6 +1062,12 @@
       doneConsumedRef.current = null;
       doneTotalRef.current = null;
       firstPageDoneIdsRef.current = null;
+      // The window counters are per board+id (see doneWindowKey): a scope
+      // switch starts fresh window bookkeeping. Late successes from the old
+      // board keep landing under the OLD board's keys and can never touch
+      // the new scope's restore windows.
+      doneMembershipEventsRef.current = {};
+      doneDeletesRef.current = {};
     }, [board, tenantFilter, includeArchived, invalidateBoardFetches]);
 
     // Load the next page of the done column. The offset anchors on the last
@@ -1194,6 +1212,11 @@
     useEffect(function () {
       if (!boardData) return undefined;
       wsClosedRef.current = false;
+      // The socket is pinned to THIS board (wsParams.board below); its
+      // membership counter keys carry the same board (doneWindowKey) so a
+      // message still in flight from a PREVIOUS board's socket cannot
+      // contaminate the new board's restore windows.
+      const wsBoard = board;
       function openWs() {
         if (wsClosedRef.current) return;
         // Build the WS URL via the host SDK so the correct auth param is used
@@ -1240,8 +1263,8 @@
                       // Count per id — the failed-write restore reads this
                       // to detect a membership change for a SPECIFIC id
                       // inside its write window (see doneMembershipEventsRef).
-                      doneMembershipEventsRef.current[e.task_id] =
-                        (doneMembershipEventsRef.current[e.task_id] || 0) + 1;
+                      doneMembershipEventsRef.current[doneWindowKey(wsBoard, e.task_id)] =
+                        (doneMembershipEventsRef.current[doneWindowKey(wsBoard, e.task_id)] || 0) + 1;
                     }
                   }
                 }
@@ -1368,14 +1391,17 @@
         // was in flight (see doneMembershipEventsRef).
         const membershipCountAtDispatch = {};
         for (const id of ids) {
-          membershipCountAtDispatch[id] = doneMembershipEventsRef.current[id] || 0;
+          membershipCountAtDispatch[id] = doneMembershipEventsRef.current[doneWindowKey(board, id)] || 0;
         }
         // Same window guard for LOCAL deletes (see doneDeletesRef): a
         // delete that succeeded inside this write window leaves no WS
-        // event — the restore must not resurrect a deleted card.
+        // event — the restore must not resurrect a deleted card. Both
+        // counters are board-keyed (see doneWindowKey): a late delete
+        // success from ANOTHER board's in-flight write must not close this
+        // board's window for a colliding id.
         const deleteCountAtDispatch = {};
         for (const id of ids) {
-          deleteCountAtDispatch[id] = doneDeletesRef.current[id] || 0;
+          deleteCountAtDispatch[id] = doneDeletesRef.current[doneWindowKey(board, id)] || 0;
         }
         const restoreFailedExtras = function (failedIdSet) {
           if (!failedIdSet || failedIdSet.size === 0) return;
@@ -1386,8 +1412,8 @@
             // the server's done membership changed under the frozen copy
             // (e.g. a foreign archive) — the WS prune already removed it,
             // restoring it would resurrect a ghost.
-            return (doneMembershipEventsRef.current[tk.id] || 0) === membershipCountAtDispatch[tk.id]
-              && (doneDeletesRef.current[tk.id] || 0) === deleteCountAtDispatch[tk.id];
+            return (doneMembershipEventsRef.current[doneWindowKey(board, tk.id)] || 0) === membershipCountAtDispatch[tk.id]
+              && (doneDeletesRef.current[doneWindowKey(board, tk.id)] || 0) === deleteCountAtDispatch[tk.id];
           });
           if (tasks.length) {
             setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
@@ -1454,12 +1480,15 @@
       // event for the same id inside the write window means the server's
       // done membership changed under the frozen copy (foreign archive/
       // completion) — the restore must not resurrect it (see
-      // doneMembershipEventsRef).
-      const membershipCountAtDispatch = doneMembershipEventsRef.current[taskId] || 0;
+      // doneMembershipEventsRef). Board-keyed (see doneWindowKey): events
+      // from another board's socket must not close this board's window.
+      const membershipCountAtDispatch = doneMembershipEventsRef.current[doneWindowKey(board, taskId)] || 0;
       // Same window guard for LOCAL deletes (see doneDeletesRef): a delete
       // that succeeded inside this write window leaves no WS event — the
-      // restore must not resurrect a card that no longer exists.
-      const deleteCountAtDispatch = doneDeletesRef.current[taskId] || 0;
+      // restore must not resurrect a card that no longer exists. Board-keyed
+      // too: a late delete success from ANOTHER board's in-flight write must
+      // not close this board's window for a colliding id.
+      const deleteCountAtDispatch = doneDeletesRef.current[doneWindowKey(board, taskId)] || 0;
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -1477,8 +1506,8 @@
         // server's done membership changed under the frozen copy and the WS
         // prune already removed it (restoring would resurrect a ghost).
         if (scopeGenRef.current.accepts(writeScopeGen)
-            && (doneMembershipEventsRef.current[taskId] || 0) === membershipCountAtDispatch
-            && (doneDeletesRef.current[taskId] || 0) === deleteCountAtDispatch) {
+            && (doneMembershipEventsRef.current[doneWindowKey(board, taskId)] || 0) === membershipCountAtDispatch
+            && (doneDeletesRef.current[doneWindowKey(board, taskId)] || 0) === deleteCountAtDispatch) {
           const restoreTasks = dispatchedExtra.filter(function (tk) {
             return tk && tk.id === taskId;
           });
@@ -1710,14 +1739,17 @@
         // was in flight (see doneMembershipEventsRef).
         const membershipCountAtDispatch = {};
         for (const id of Array.from(selectedIds)) {
-          membershipCountAtDispatch[id] = doneMembershipEventsRef.current[id] || 0;
+          membershipCountAtDispatch[id] = doneMembershipEventsRef.current[doneWindowKey(board, id)] || 0;
         }
         // Same window guard for LOCAL deletes (see doneDeletesRef): a
         // delete that succeeded inside this write window leaves no WS
-        // event — the restore must not resurrect a deleted card.
+        // event — the restore must not resurrect a deleted card. Both
+        // counters are board-keyed (see doneWindowKey): a late delete
+        // success from ANOTHER board's in-flight write must not close this
+        // board's window for a colliding id.
         const deleteCountAtDispatch = {};
         for (const id of Array.from(selectedIds)) {
-          deleteCountAtDispatch[id] = doneDeletesRef.current[id] || 0;
+          deleteCountAtDispatch[id] = doneDeletesRef.current[doneWindowKey(board, id)] || 0;
         }
         const restoreFailedExtras = function (failedIdSet) {
           if (!changesDoneMembership) return;
@@ -1729,8 +1761,8 @@
             // the server's done membership changed under the frozen copy
             // (e.g. a foreign archive) — the WS prune already removed it,
             // restoring it would resurrect a ghost.
-            return (doneMembershipEventsRef.current[tk.id] || 0) === membershipCountAtDispatch[tk.id]
-              && (doneDeletesRef.current[tk.id] || 0) === deleteCountAtDispatch[tk.id];
+            return (doneMembershipEventsRef.current[doneWindowKey(board, tk.id)] || 0) === membershipCountAtDispatch[tk.id]
+              && (doneDeletesRef.current[doneWindowKey(board, tk.id)] || 0) === deleteCountAtDispatch[tk.id];
           });
           if (tasks.length) {
             setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
@@ -1868,19 +1900,30 @@
        destructive: true,
      }).then(function (r) {
       if (!r.confirmed) return null;
+      // Scope generation at dispatch: the success handler below prunes and
+      // invalidates for THIS board's scope only. A board switch while the
+      // DELETE is in flight must not prune the NEW scope's extra pages —
+      // ids collide across boards (one kanban_db file per board), so a raw
+      // -id prune would erase the new board's still-done same-id card.
+      const deleteScopeGen = scopeGenRef.current.current();
       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "DELETE",
       }).then(function () {
         // Count the successful delete per id (see doneDeletesRef): the
         // failed-write restores must not resurrect this card if one of
-        // their windows overlaps this delete.
-        doneDeletesRef.current[taskId] = (doneDeletesRef.current[taskId] || 0) + 1;
-        // Deleted cards must also leave the held extra done pages, or the
-        // merge resurrects them (same ghost-card class as moves). refreshBoard
-        // (not the dispatch-time loadBoard): a scope switch while the DELETE
-        // was in flight must refresh the NEW scope.
-        setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
-        invalidateBoardFetches();
+        // their windows overlaps this delete. Board-keyed (see
+        // doneWindowKey): the count belongs to THIS board's db and can
+        // never close another board's restore window for a colliding id.
+        const deleteKey = doneWindowKey(board, taskId);
+        doneDeletesRef.current[deleteKey] = (doneDeletesRef.current[deleteKey] || 0) + 1;
+        if (scopeGenRef.current.accepts(deleteScopeGen)) {
+          // Deleted cards must also leave the held extra done pages, or the
+          // merge resurrects them (same ghost-card class as moves). refreshBoard
+          // (not the dispatch-time loadBoard): a scope switch while the DELETE
+          // was in flight must refresh the NEW scope.
+          setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+          invalidateBoardFetches();
+        }
         refreshBoard();
          setSelectedIds(function (prev) {
            const next = new Set(prev);
@@ -1901,6 +1944,11 @@
         destructive: true,
       }).then(function (r) {
         if (!r.confirmed) return null;
+        // Scope generation at dispatch: the success handler prunes and
+        // invalidates for THIS board's scope only — a board switch while a
+        // DELETE is in flight must not prune the NEW scope's extra pages
+        // (ids collide across boards, see doneWindowKey).
+        const deleteScopeGen = scopeGenRef.current.current();
         const ids = Array.from(selectedIds);
         setSelectedIds(new Set());
         // Partial success must still count: one failing DELETE must not
@@ -1918,14 +1966,22 @@
               deletedIds.push(ids[i]);
               // Count the successful delete per id (see doneDeletesRef):
               // failed-write restores must not resurrect this card if one
-              // of their windows overlaps this delete.
-              doneDeletesRef.current[ids[i]] = (doneDeletesRef.current[ids[i]] || 0) + 1;
+              // of their windows overlaps this delete. Board-keyed (see
+              // doneWindowKey): the count belongs to THIS board's db and
+              // can never close another board's restore window.
+              const deleteKey = doneWindowKey(board, ids[i]);
+              doneDeletesRef.current[deleteKey] = (doneDeletesRef.current[deleteKey] || 0) + 1;
             }
             else failed.push({ id: ids[i], error: res.reason });
           });
-          if (deletedIds.length) {
+          if (deletedIds.length && scopeGenRef.current.accepts(deleteScopeGen)) {
             setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(deletedIds)); });
             invalidateBoardFetches();
+            refreshBoard();
+          }
+          else if (deletedIds.length) {
+            // Old-scope successes still trigger the (scope-fresh) refresh;
+            // only the prune/invalidation is bound to the dispatch scope.
             refreshBoard();
           }
           if (failed.length) {
@@ -5666,6 +5722,7 @@
       withMergedDoneColumn: withMergedDoneColumn,
       pruneExtraDoneTasks: pruneExtraDoneTasks,
       restoreExtraDoneTasks: restoreExtraDoneTasks,
+      doneWindowKey: doneWindowKey,
       doneMembershipEventKinds: DONE_MEMBERSHIP_EVENT_KINDS,
       withOptimisticMove: withOptimisticMove,
       createFetchGate: createFetchGate,

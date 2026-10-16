@@ -343,6 +343,17 @@ function createServer(extraTasks: any[] = []) {
 
       if (deleteFailures.has(id)) { return Promise.reject(new Error(`delete failed: ${id}`)) }
 
+      if (deferDeleteMode) {
+        // Deferred deletes apply server-side at RELEASE time: the fixture's
+        // task map is shared across boards, so keeping the deleted task in
+        // the map until release lets the same id keep living on the OTHER
+        // board — exactly the cross-board id collision under test (ids are
+        // only unique within one board's kanban_db file).
+        return new Promise((resolve) => {
+          deferred.push({ url, payload: {}, resolve: () => { tasks.delete(id); resolve({}) } })
+        })
+      }
+
       tasks.delete(id)
 
       return Promise.resolve({})
@@ -357,6 +368,7 @@ function createServer(extraTasks: any[] = []) {
   const deferredWritesEnabled = () => deferWriteMode
   let deferBoardReadMode = false
   const boardReadDeferEnabled = () => deferBoardReadMode
+  let deferDeleteMode = false
 
   return {
     route,
@@ -368,7 +380,11 @@ function createServer(extraTasks: any[] = []) {
     // Parks FIRST-PAGE /board reads (built at request time): the test holds a
     // read in flight across a membership mutation — the stale-overwrite race.
     setDeferBoardReads(v: boolean) { deferBoardReadMode = v },
+    // Parks DELETE responses (applied server-side at release time): the test
+    // holds a delete in flight across a board switch — the cross-board
+    // id-collision race.
     setDeleteFailures(ids: string[]) { for (const id of ids) { deleteFailures.add(id) } },
+    setDeferDeletes(v: boolean) { deferDeleteMode = v },
     // Marks bulk/PATCH ids whose WRITE fails (mutation not applied, ok:false /
     // rejection) — drives the failed-move restore paths.
     setWriteFailures(ids: string[]) { for (const id of ids) { writeFailures.add(id) } },
@@ -1982,6 +1998,145 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     await h.flush()
     expect(h.doneIds()).toEqual(['d1', 'd2', 'd3'])
     expect(h.donePaging()).toEqual({ total: 3, loaded: 3, hasMore: false })
+    h.unmount()
+  })
+
+  it('a DELETE that settles after a board switch must not prune the new board\u2019s extra pages (same-id collision)', async () => {
+    // Task ids are unique only WITHIN one board's db (one kanban_db file per
+    // board) — the fixture serves the same ids for every board, which is
+    // exactly the cross-board collision shape. A delete dispatched on board
+    // A whose success lands after the switch to board B prunes by raw id:
+    // without the scope guard it erases board B's still-done same-id card
+    // from the held extra pages (reverse ghost until the filter switch).
+    const server = createServer()
+    server.setDeferDeletes(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Board A: load the extra page, delete d2 there (response parked).
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    h.boardColumnsProps().onDelete('d2')
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+    expect(h.callsTo('/tasks/d2').some((c) => (c.opts && c.opts.method) === 'DELETE')).toBe(true)
+    // Still held: the DELETE response is parked in flight.
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Switch to board B while the DELETE is in flight and re-load the extra
+    // page there — board B serves the same id (the collision under test).
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // The parked DELETE settles now — it belongs to board A. The prune and
+    // the page-gate invalidation are bound to the dispatch scope: board B's
+    // same-id card stays in the held extras.
+    server.releaseDeferred('/tasks/d2')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    h.unmount()
+  })
+
+  it('a bulk DELETE that settles after a board switch must not prune the new board\u2019s extra pages either', async () => {
+    // Sibling path of the single delete: deleteSelected's success handler
+    // prunes every fulfilled DELETE by raw id — same cross-board collision
+    // guard required.
+    const server = createServer()
+    server.setDeferDeletes(true)
+    const h = mount(server)
+    await h.flush()
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Board A: select the extra-page card d2 and bulk-delete it (deleteSelected
+    // path — its success handler prunes every fulfilled DELETE by raw id).
+    // d1 stays: the fixture's task map is shared across boards, deleting it
+    // would empty board B's FIRST page too and bury the assertion.
+    h.boardColumnsProps().toggleSelected('d2')
+    await h.flush()
+    h.nodeWithProp('onDelete').onDelete(1)
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+    expect(h.callsTo('/tasks/d2').some((c) => (c.opts && c.opts.method) === 'DELETE')).toBe(true)
+
+    // Switch to board B while both DELETEs are in flight; rebuild its held
+    // extra page (same ids — the collision shape).
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // Both parked DELETEs settle — board A's successes. Board B's held
+    // extra page must survive them.
+    server.releaseDeferred('/tasks/')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    h.unmount()
+  })
+
+  it('a delete success from the OLD board must not suppress the new board\u2019s failed-move restore (same-id collision)', async () => {
+    // The delete counter is board-keyed (doneWindowKey): board A's late
+    // delete success lands under board A's key and must not close board B's
+    // write window for the same id — board B's failed move must still
+    // restore its extra-page card. With a raw-id counter the late success
+    // bumps the shared count and the restore is silently skipped.
+    const server = createServer([doneTask('d0', 400)])
+    server.setWriteFailures(['d2'])
+    server.setDeferWrites(true)
+    server.setDeferDeletes(true)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0'])
+
+    // Board A: load both extra pages, then delete d2 (response parked).
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+    h.boardColumnsProps().onDelete('d2')
+    await h.flush()
+    h.dialogsProps().dialogProps.onConfirm()
+    await h.flush()
+
+    // Switch to board B while the DELETE is in flight and rebuild the held
+    // extras there (same ids — the collision shape).
+    h.nodeWithProp('onSwitch').onSwitch('board-b')
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
+
+    // Move d2 to todo on board B; the PATCH is parked and will fail.
+    h.boardColumnsProps().onMove('d2', 'todo')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d0', 'd1'])
+
+    // Board A's parked DELETE settles first (older request) — its success
+    // must count under board A's key only.
+    server.releaseFirstDeferred()
+    await h.flush()
+    // Then board B's failing PATCH settles: the restore must fire.
+    server.releaseFirstDeferred()
+    await h.flush()
+
+    const patch = h.callsTo('/tasks/d2').find((c) => (c.opts && c.opts.method) === 'PATCH')
+    expect(patch).toBeTruthy()
+    expect(h.doneIds()).toEqual(['d0', 'd1', 'd2'])
     h.unmount()
   })
 })
