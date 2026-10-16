@@ -162,6 +162,15 @@
     return pages;
   }
 
+  // Ids of a board payload's done column, in server order (or null when the
+  // payload has no done column). Pure; tested.
+  function doneColumnIds(board) {
+    if (!board || !board.columns) return null;
+    const col = board.columns.find(function (c) { return c && c.name === "done"; });
+    if (!col) return null;
+    return (col.tasks || []).map(function (t) { return t && t.id; });
+  }
+
   // WS event kinds that change done membership server-side. The dashboard's
   // own status PATCH and the reopen cascade append `status`; a FOREIGN client
   // completing or archiving a task goes through the core, which appends
@@ -910,12 +919,49 @@
           setBoardData(data);
           // Re-anchor the done-page consumption window in SERVER coordinates:
           // this response's done_pagination says exactly which done window it
-          // represents — the baseline the next "Load more" corrects its
-          // offset against (see loadMoreDone).
+          // represents. The response's total also advances the consistent
+          // totals source (doneTotalRef) the next "Load more" corrects its
+          // offset against.
+          //
+          // When extra pages are still held across this refresh, the anchor
+          // must NOT blindly reset to the first page's boundary: an unchanged
+          // window (same total, same first-page head) means the held extras
+          // still occupy exactly [boundary, prior.offset) — rewinding would
+          // make the next "Load more" re-fetch already-held pages, a rewind
+          // the merge's dedupe hides, so under ongoing refreshes the column
+          // would never page forward. Keep the anchor past the held extras.
+          // A CHANGED window, though, means the done list shifted and the
+          // held extras' server coordinates are unknown — re-anchor at the
+          // fresh boundary: everything below it is the fresh first page (no
+          // card can be skipped), cards that fell out of the replaced first
+          // page sit right past it and arrive on the next click, repeats are
+          // deduped by the merge.
           const pg = data && data.done_pagination;
-          doneConsumedRef.current = (pg && typeof pg.total === "number" && typeof pg.limit === "number")
-            ? { offset: Math.min(pg.total, (pg.offset || 0) + pg.limit), total: pg.total }
-            : null;
+          const freshIds = doneColumnIds(data);
+          if (pg && typeof pg.total === "number" && typeof pg.limit === "number") {
+            doneTotalRef.current = pg.total;
+            const boundary = Math.min(pg.total, (pg.offset || 0) + pg.limit);
+            const prior = doneConsumedRef.current;
+            const heldIds = firstPageDoneIdsRef.current;
+            const idsEqual = !!freshIds && !!heldIds
+              && freshIds.length === heldIds.length
+              && freshIds.every(function (id, i) { return id === heldIds[i]; });
+            const windowUnchanged = !!prior
+              && typeof prior.offset === "number" && typeof prior.total === "number"
+              && pg.total === prior.total
+              && idsEqual;
+            doneConsumedRef.current = (windowUnchanged
+              && typeof prior.offset === "number")
+              ? { offset: Math.max(boundary, prior.offset), total: pg.total }
+              : { offset: boundary, total: pg.total };
+          } else {
+            doneTotalRef.current = null;
+            doneConsumedRef.current = null;
+          }
+          // Remember THIS response's first-page head for the next refresh's
+          // window-unchanged check (load-more responses don't touch it —
+          // their done window is a deeper page, not the head).
+          firstPageDoneIdsRef.current = freshIds;
           cursorRef.current = data.latest_event_id || 0;
           setError(null);
         })
@@ -950,6 +996,23 @@
     // them up) — an offset taken from the held count would then SKIP a
     // still-done card between the fresh first page and the extras.
     const doneConsumedRef = useRef(null);
+    // The done TOTAL as reported by the most recent ACCEPTED /board response
+    // (first page or "Load more" — both reflect server truth at their build
+    // time). This is the consistent totals source for the load-more delta:
+    // correcting against `kanbanBoard.done_pagination.total` instead would
+    // mix a stale first-page total with the anchor's fresh one — a phantom
+    // delta that makes every repeated click skip one still-done card (e.g. a
+    // foreign change BELOW the consumed window changes the server total
+    // without shifting any position the client holds). Reset with the anchor
+    // on scope change; advanced by every accepted response.
+    const doneTotalRef = useRef(null);
+    // Ids of the last accepted FIRST page's done column, in server order.
+    // The refresh anchor keeps the consumption window only when BOTH the
+    // total and this head are unchanged — a head change means the done list
+    // shifted (a completion pushes every held card down, a first-page
+    // departure pulls it up), and the held extras' server coordinates are
+    // then unknown: re-anchor at the fresh boundary (never skips a card).
+    const firstPageDoneIdsRef = useRef(null);
 
     // Extra done pages are fetched per board/filter scope — drop them when
     // the scope changes so stale pages from another board or filter never
@@ -961,9 +1024,12 @@
       scopeGenRef.current.bump();
       invalidateBoardFetches();
       setExtraDone([]);
-      // The consumption anchor belongs to the old scope's list — reset it
-      // until the new scope's first page re-anchors it.
+      // The consumption anchor and the known totals source belong to the old
+      // scope's list — reset them until the new scope's first page re-anchors
+      // both.
       doneConsumedRef.current = null;
+      doneTotalRef.current = null;
+      firstPageDoneIdsRef.current = null;
     }, [board, tenantFilter, includeArchived, invalidateBoardFetches]);
 
     // Load the next page of the done column. The offset anchors on the last
@@ -990,10 +1056,21 @@
       // the total delta since: every membership change shifts the list below
       // the consumed window by exactly (totalNow - totalAtFetch).
       const consumed = doneConsumedRef.current;
+      // Consistent totals for the delta: BOTH numbers must come from the same
+      // response lineage. consumed.total is the total of the last applied
+      // page's response; doneTotalRef is the total of the most recent
+      // accepted response (that page or a later one). Correcting against
+      // kanbanBoard.done_pagination.total instead — the FIRST page's total,
+      // never advanced by the load-more path — mixes two different server
+      // epochs: any membership change between them (e.g. a foreign archive
+      // BELOW the consumed window, which changes the total without shifting
+      // a single position the client holds) becomes a phantom delta, and
+      // every repeated click then skips one still-done card.
+      const knownTotal = doneTotalRef.current;
       let requestOffset = paging.loaded;
-      if (consumed && pagination && typeof pagination.total === "number"
+      if (consumed && typeof knownTotal === "number"
         && typeof consumed.total === "number" && typeof consumed.offset === "number") {
-        requestOffset = Math.max(0, consumed.offset + (pagination.total - consumed.total));
+        requestOffset = Math.max(0, consumed.offset + (knownTotal - consumed.total));
       }
       // Token for this request; the gate is bumped on every scope change AND
       // on every membership mutation, so a response that lands after either
@@ -1014,9 +1091,20 @@
           // overlap with the held pages — duplicates must not pile up in the
           // extras, or the paging math ("X von Y geladen") drifts too.
           setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, page); });
-          // Re-anchor the consumption window at THIS response's coordinates.
+          // Re-anchor the consumption window at THIS response's coordinates,
+          // advance the consistent totals source, and write the fresh
+          // done_pagination back into the board state — the paging math
+          // ("X von Y geladen", hasMore) reads kanbanBoard.done_pagination,
+          // and leaving it at the first page's stale total would desync both
+          // after any membership change.
           const pg = data && data.done_pagination;
-          if (pg && typeof pg.total === "number" && typeof pg.limit === "number") {
+          if (pg && typeof pg.total === "number") {
+            doneTotalRef.current = pg.total;
+            setBoardData(function (b) {
+              return (b && b.done_pagination !== pg)
+                ? Object.assign({}, b, { done_pagination: pg })
+                : b;
+            });
             doneConsumedRef.current = {
               offset: Math.min(pg.total, (typeof pg.offset === "number" ? pg.offset : requestOffset) + page.length),
               total: pg.total,

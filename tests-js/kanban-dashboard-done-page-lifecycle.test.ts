@@ -1621,4 +1621,70 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     expect(h.todoIds()).toEqual(['d0'])
     h.unmount()
   })
+
+  it('a foreign change below the consumed window must not skip a still-done card on repeated load-more clicks (consistent totals)', async () => {
+    // d4 sits BELOW everything the client has consumed: a foreign archive of
+    // it changes the server total without shifting a single position the
+    // client holds. The load-more delta must compare the anchor's total with
+    // the most recent accepted response's total (same response lineage) —
+    // correcting against the FIRST page's done_pagination.total instead
+    // (never advanced by the load-more path) mixes two server epochs: the
+    // change becomes a phantom +1 delta and every repeated click skips one
+    // still-done card — d3 strands unreachable, every further click requests
+    // an offset past the end.
+    const server = createServer([doneTask('d3', 150), doneTask('d4', 100)])
+    server.setDoneLimit(1)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    expect(h.donePaging()).toEqual({ total: 4, loaded: 1, hasMore: true })
+
+    // Click 1 consumes server index 1 (d2). The response is built from
+    // post-archive server truth (total 3) and re-anchors the window on it.
+    server.setTaskStatus('d4', 'archived')  // foreign archive BELOW the window
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    expect(h.donePaging()).toEqual({ total: 3, loaded: 2, hasMore: true })
+
+    // Click 2 must request server index 2 — d3, still done.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2', 'd3'])
+    expect(h.donePaging()).toEqual({ total: 3, loaded: 3, hasMore: false })
+    h.unmount()
+  })
+
+  it('a first-page refresh between load-more clicks must not rewind the consumption anchor (forward progress)', async () => {
+    // The held extras survive a first-page refresh — with an UNCHANGED window
+    // (same total, same first-page head) the consumption anchor must too:
+    // resetting it to the first-page boundary rewinds the window and the next
+    // click re-fetches already-held pages (the merge dedupes the repeat), so
+    // with a refresh between every click the column never pages forward.
+    const server = createServer([doneTask('d3', 100)])
+    server.setDoneLimit(1)
+    const h = mount(server)
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Click 1 consumes server index 1 (d2) — the extras hold it.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // A refresh with NO membership change (toolbar / WS-debounced reload):
+    // fresh first page, extras survive, window unchanged. The anchor must
+    // stay past the held extra (server index 2), not rewind to the boundary.
+    h.nodeWithProp('onRefresh').onRefresh()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // The single next click must reach d3 — a rewound anchor would request
+    // server index 1 (d2 again, silently deduped) and stall.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2', 'd3'])
+    expect(h.donePaging()).toEqual({ total: 3, loaded: 3, hasMore: false })
+    h.unmount()
+  })
 })
