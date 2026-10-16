@@ -162,6 +162,17 @@
     return pages;
   }
 
+  // WS event kinds that change done membership server-side. The dashboard's
+  // own status PATCH and the reopen cascade append `status`; a FOREIGN client
+  // completing or archiving a task goes through the core, which appends
+  // `completed` (kanban_db.complete_task) and `archived`
+  // (kanban_db.archive_task) — never `status`. Every other kind (edited,
+  // commented, attached, …; `reclaimed` — reclaim_task refuses done tasks)
+  // leaves done membership untouched and must NOT prune or invalidate: a
+  // wrong prune makes a still-done extra-page card vanish until the next
+  // "Load more". Pure data; tested.
+  const DONE_MEMBERSHIP_EVENT_KINDS = new Set(["status", "completed", "archived"]);
+
   // Optimistic move shared by all move paths (single move, bulk move, bulk
   // patch): removes the moved ids from every column and prepends them (with
   // the new status) to the destination column. Cards that only live in a
@@ -984,16 +995,19 @@
               const msg = JSON.parse(ev.data);
               if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
                 cursorRef.current = msg.cursor || cursorRef.current;
-                // Status events change board membership server-side (a task
-                // enters or leaves the done column). A "Load more" response
-                // built before the change would attach its pre-event page
-                // after the refresh — discard it immediately, before the
-                // debounced reload. Non-membership events (edited, comment,
-                // …) leave in-flight pagination alone.
+                // Membership events change board membership server-side (a
+                // task enters or leaves the done column): the dashboard's own
+                // status PATCH and the reopen cascade append `status`, a
+                // FOREIGN client's completion/archive appends `completed` /
+                // `archived` (kanban_db complete_task/archive_task). A "Load
+                // more" response built before the change would attach its
+                // pre-event page after the refresh — discard it immediately,
+                // before the debounced reload. Non-membership events (edited,
+                // comment, …) leave in-flight pagination alone.
                 let membershipChanged = false;
                 const membershipTaskIds = [];
                 for (const e of msg.events) {
-                  if (e && e.kind === "status") {
+                  if (e && DONE_MEMBERSHIP_EVENT_KINDS.has(e.kind)) {
                     membershipChanged = true;
                     if (e.task_id) membershipTaskIds.push(e.task_id);
                   }
@@ -5329,6 +5343,7 @@
       withMergedDoneColumn: withMergedDoneColumn,
       pruneExtraDoneTasks: pruneExtraDoneTasks,
       restoreExtraDoneTasks: restoreExtraDoneTasks,
+      doneMembershipEventKinds: DONE_MEMBERSHIP_EVENT_KINDS,
       withOptimisticMove: withOptimisticMove,
       createDonePageGate: createDonePageGate,
       // Real drawer component — the lifecycle harness drives it directly

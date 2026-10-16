@@ -1231,6 +1231,96 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     h.unmount()
   })
 
+  it('a WS archived event (foreign archive) prunes the held extra-page card and invalidates an in-flight load-more', async () => {
+    const server = createServer()
+    server.setDeferLoadMore(true)
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // Load-more in flight; its page is built from PRE-event server state.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // A FOREIGN client archives d2 — the core appends kind 'archived'
+    // (kanban_db.archive_task), never 'status' — while the page is parked.
+    const ws = h.wsInstances[0]
+
+    if (ws.onopen) { ws.onopen() }
+    server.setTaskStatus('d2', 'archived')
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'archived' }], cursor: 2 }) })
+    await h.flush()
+
+    // The event released the loading lock immediately.
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+
+    // The parked pre-event page lands — it must be discarded: d2 left done
+    // server-side and the held extra-page copy is already pruned, so it
+    // would come back as a ghost into the merged column.
+    server.releaseDeferred('done_offset')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a WS completed event (foreign completion) invalidates an in-flight load-more', async () => {
+    const server = createServer()
+    server.setDeferLoadMore(true)
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // A FOREIGN client completes a task — the core appends kind 'completed'
+    // (kanban_db.complete_task), never 'status' — while the page is parked.
+    // The page was built before the membership change (its offset math is
+    // stale) and must be discarded; the debounced reload delivers the new
+    // done card through the fresh first page.
+    const ws = h.wsInstances[0]
+
+    if (ws.onopen) { ws.onopen() }
+    server.setTaskStatus('t1', 'done')
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 't1', kind: 'completed' }], cursor: 2 }) })
+    await h.flush()
+
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+
+    server.releaseDeferred('done_offset')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a WS reclaimed event is not a membership event (no prune, no invalidation)', async () => {
+    const server = createServer()
+    server.setDeferLoadMore(true)
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    // reclaim_task refuses done tasks (running-only), so 'reclaimed' never
+    // changes done membership — the held pages and the in-flight page must
+    // stay untouched (a wrong prune would make a still-done card vanish).
+    const ws = h.wsInstances[0]
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'reclaimed' }], cursor: 2 }) })
+    await h.flush()
+    expect(h.boardColumnsProps().doneLoading).toBe(true)
+
+    server.releaseDeferred('done_offset')
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    expect(h.boardColumnsProps().doneLoading).toBe(false)
+    h.unmount()
+  })
+
   it('a failed single move restores the extra-page card (no vanishing card)', async () => {
     const server = createServer()
     server.setWriteFailures(['d2'])
