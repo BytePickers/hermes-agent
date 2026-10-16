@@ -178,10 +178,18 @@ function createServer(extraTasks: any[] = []) {
   const writeFailures = new Set<string>()
 
   const LIMIT = 1
+  // Drift tests need a WIDER first-page window than the ghost tests: the
+  // gap scenario requires a multi-card first page that a new completion can
+  // shift cards out of. Defaults to the ghost tests' 1-card window.
+  let doneLimit = LIMIT
 
-  const doneSorted = () =>
-    [...tasks.values()]
-      .filter((t) => t.status === 'done')
+  // Tenant emulation for the stale-scope-refresh tests: a real /board read
+  // with ?tenant= filters the WHOLE board to that tenant's cards.
+  const tasksByTenant = (list: any[], tenant: string) =>
+    tenant ? list.filter((t) => t.tenant === tenant) : list
+
+  const doneSorted = (tenant = ''): any[] =>
+    tasksByTenant([...tasks.values()].filter((t) => t.status === 'done'), tenant)
       .sort((a, b) => {
         const aOpen = a.completed_at == null
         const bOpen = b.completed_at == null
@@ -193,14 +201,15 @@ function createServer(extraTasks: any[] = []) {
         return a.id < b.id ? 1 : (a.id > b.id ? -1 : 0)
       })
 
-  const serveBoard = (offset: number) => {
-    const done = doneSorted()
-    const window = done.slice(offset, offset + LIMIT)
+  const serveBoard = (offset: number, tenant = '') => {
+    const limit = Math.max(1, doneLimit)
+    const done = doneSorted(tenant)
+    const window = done.slice(offset, offset + limit)
 
     return {
       columns: [
         { name: 'triage', tasks: [] },
-        { name: 'todo', tasks: [...tasks.values()].filter((t) => t.status === 'todo') },
+        { name: 'todo', tasks: tasksByTenant([...tasks.values()].filter((t) => t.status === 'todo'), tenant) },
         { name: 'ready', tasks: [] },
         { name: 'running', tasks: [] },
         { name: 'blocked', tasks: [] },
@@ -210,7 +219,7 @@ function createServer(extraTasks: any[] = []) {
       tenants: ['infra'],
       assignees: [],
       latest_event_id: 1,
-      done_pagination: { total: done.length, offset, limit: LIMIT },
+      done_pagination: { total: done.length, offset, limit },
     }
   }
 
@@ -231,7 +240,7 @@ function createServer(extraTasks: any[] = []) {
 
     if (url.includes('/board') && qs.has('done_offset')) {
       const offset = Number(qs.get('done_offset') || 0)
-      const payload = serveBoard(offset)
+      const payload = serveBoard(offset, qs.get('tenant') || '')
 
       if (!deferredEnabled()) { return Promise.resolve(payload) }
 
@@ -242,7 +251,7 @@ function createServer(extraTasks: any[] = []) {
       // First-page reads can be deferred too: the response is built at REQUEST
       // time (pre-mutation server truth) and released by the test later —
       // pins down the stale-/board-read race.
-      const payload = serveBoard(0)
+      const payload = serveBoard(0, qs.get('tenant') || '')
 
       if (!boardReadDeferEnabled()) { return Promise.resolve(payload) }
 
@@ -390,6 +399,16 @@ function createServer(extraTasks: any[] = []) {
       if (t) { t.status = status }
     },
     deleteTask(id: string) { tasks.delete(id) },
+    // Drift tests: a wider first-page window than the ghost tests' 1-card
+    // limit — the gap scenario needs a multi-card first page.
+    setDoneLimit(n: number) { doneLimit = n },
+    // A FOREIGN client completes a card (kanban_db.complete_task appends
+    // `completed`): it enters the done list at the TOP (newest completed_at).
+    completeTask(id: string, completedAt: number) {
+      const t = tasks.get(id)
+
+      if (t) { t.status = 'done'; t.completed_at = completedAt }
+    },
   }
 }
 
@@ -830,6 +849,82 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     await h.flush()
     // Without the gate the stale page-2 card would appear here as a ghost.
     expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a write that settles after a tenant switch refreshes the NEW scope (no old-scope overwrite)', async () => {
+    // x1 lives in another tenant; the unfiltered board shows it, the
+    // tenant=infra scope must not.
+    const server = createServer([
+      { id: 'x1', status: 'todo', title: 'task x1', completed_at: null, tenant: 'acme' },
+    ])
+
+    server.setDeferWrites(true)
+    const h = mount(server)
+
+    await h.flush()
+    expect(h.todoIds()).toEqual(expect.arrayContaining(['t1', 'x1']))
+
+    // Dispatch a single move; its PATCH response is parked in flight.
+    h.boardColumnsProps().onMove('d1', 'todo')
+    await h.flush()
+
+    // Switch the tenant scope while the write is in flight. The scope effect
+    // re-reads the board under the new filter — x1 drops out of view.
+    h.nodeWithProp('setTenantFilter').setTenantFilter('infra')
+    await h.flush()
+    expect(h.todoIds()).not.toContain('x1')
+
+    // The write settles NOW. Its post-commit refresh must re-read the NEW
+    // scope (?tenant=infra): the dispatch-time loadBoard closure would
+    // rebuild the old (unfiltered) query and — riding the fresh gate token
+    // the post-commit invalidation just minted — overwrite the new scope's
+    // board with it (x1 would reappear, potentially another tenant's data).
+    server.releaseDeferred('/tasks/')
+    await h.flush()
+
+    const boardReads = h.callsTo('/board').filter((c) => !c.url.includes('done_offset'))
+    const lastRead = boardReads[boardReads.length - 1]
+    expect(new URLSearchParams(lastRead.url.split('?')[1] || '').get('tenant')).toBe('infra')
+    expect(h.todoIds()).not.toContain('x1')
+    h.unmount()
+  })
+
+  it('a first-page refresh that shifted the done list fills the gap on the next load-more (no skipped card)', async () => {
+    const server = createServer([{ ...doneTask('d3', 100) }, openTask('n0')])
+    server.setDoneLimit(2)
+    const h = mount(server)
+    await h.flush()
+    // First page (limit 2): d1, d2 — d3 lives beyond it.
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+    expect(h.donePaging()).toEqual({ total: 3, loaded: 2, hasMore: true })
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2', 'd3'])
+
+    // A foreign client completes n0 — it enters done at the TOP and pushes
+    // every older card one position down. The next first-page refresh (WS
+    // reload / toolbar) re-reads only the first window; the held extras are
+    // frozen.
+    server.completeTask('n0', 400)
+    h.nodeWithProp('onRefresh').onRefresh()
+    await h.flush()
+
+    // Fresh first page is [n0, d1]; extras still hold d3. d2 now sits in the
+    // gap between them — the held-count offset (3) would request slice[3:] =
+    // [d3] (a repeat, silently deduped) and d2 would NEVER load.
+    expect(h.doneIds()).toEqual(expect.arrayContaining(['n0', 'd1', 'd3']))
+    expect(h.donePaging()).toEqual({ total: 4, loaded: 3, hasMore: true })
+
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+
+    // Drift-corrected offset (consumed 2 + total delta 0) requests
+    // slice[2:] = [d2, d3] — the gap card d2 arrives; the d3 repeat is
+    // deduped by the merge.
+    expect(h.doneIds()).toEqual(['n0', 'd1', 'd2', 'd3'])
+    expect(h.donePaging()).toEqual({ total: 4, loaded: 4, hasMore: false })
     h.unmount()
   })
 
