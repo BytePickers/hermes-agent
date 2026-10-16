@@ -135,6 +135,137 @@
     return Object.assign({}, board, { columns: merged });
   }
 
+  // Drop task ids that left the board (move, bulk move, delete) from the
+  // held extra pages. The optimistic board update only rewrites the first
+  // page (`kanbanBoard`); a card that lived only in a loaded page would
+  // otherwise survive the move in `extraDone` and be resurrected into the
+  // done column by the merge — a ghost card until the next scope switch.
+  function pruneExtraDoneTasks(extraPages, ids) {
+    const pages = extraPages || [];
+    if (!ids || typeof ids.has !== "function" || ids.size === 0) return pages;
+    return pages.filter(function (tk) { return !(tk && tk.id && ids.has(tk.id)); });
+  }
+
+  // Put task objects BACK into the held extra pages when a membership write
+  // FAILED for them: the dispatch-time prune removed them optimistically, but
+  // a failed write never moved the card server-side — it is still done, and
+  // (living beyond the first page) would vanish from the merged column until
+  // the next "Load more". Appends only ids not already held (the merge
+  // dedupes, but keeping the extras duplicate-free keeps paging math honest).
+  // Pure; tested.
+  function restoreExtraDoneTasks(extraPages, tasks) {
+    const pages = (extraPages || []).slice();
+    const held = new Set(pages.map(function (tk) { return tk && tk.id; }));
+    for (const tk of (tasks || [])) {
+      if (tk && tk.id && !held.has(tk.id)) { pages.push(tk); held.add(tk.id); }
+    }
+    return pages;
+  }
+
+  // Window-counter key for the per-id done-window guards (WS membership
+  // events, successful local deletes). Task ids are only unique WITHIN one
+  // board's DB — each board has its own kanban_db file, so ids can collide
+  // ACROSS boards. A counter keyed by the raw id alone would let a late
+  // success from board A's in-flight write leak into board B's restore
+  // window and suppress a legitimate restore of board B's same-id card.
+  // Keying by board + id keeps every window comparison inside the board it
+  // was opened for. Pure; tested.
+  function doneWindowKey(board, taskId) {
+    return (board || "") + ":" + taskId;
+  }
+
+  // Ids of a board payload's done column, in server order (or null when the
+  // payload has no done column). Pure; tested.
+  function doneColumnIds(board) {
+    if (!board || !board.columns) return null;
+    const col = board.columns.find(function (c) { return c && c.name === "done"; });
+    if (!col) return null;
+    return (col.tasks || []).map(function (t) { return t && t.id; });
+  }
+
+  // WS event kinds that change done membership server-side. The dashboard's
+  // own status PATCH and the reopen cascade append `status`; a FOREIGN client
+  // completing or archiving a task goes through the core, which appends
+  // `completed` (kanban_db.complete_task) and `archived`
+  // (kanban_db.archive_task) — never `status`. Every other kind (edited,
+  // commented, attached, …; `reclaimed` — reclaim_task refuses done tasks)
+  // leaves done membership untouched and must NOT prune or invalidate: a
+  // wrong prune makes a still-done extra-page card vanish until the next
+  // "Load more". Pure data; tested.
+  const DONE_MEMBERSHIP_EVENT_KINDS = new Set(["status", "completed", "archived"]);
+
+  // Optimistic move shared by all move paths (single move, bulk move, bulk
+  // patch): removes the moved ids from every column and prepends them (with
+  // the new status) to the destination column. Cards that only live in a
+  // loaded extra done page are invisible to the raw columns, so they are
+  // pulled from `extraDoneTasks` — paired with pruneExtraDoneTasks this
+  // keeps them out of the done merge AND lands them in the destination
+  // immediately, before the server refresh arrives. Pure; tested.
+  function withOptimisticMove(board, ids, newStatus, extraDoneTasks) {
+    if (!board || !board.columns) return board;
+    const idSet = ids || new Set();
+    const moved = [];
+    const columns = board.columns.map(function (col) {
+      const kept = [];
+      for (const tk of col.tasks) {
+        if (tk && idSet.has(tk.id)) moved.push(Object.assign({}, tk, { status: newStatus }));
+        else kept.push(tk);
+      }
+      return Object.assign({}, col, { tasks: kept });
+    });
+    if (extraDoneTasks && extraDoneTasks.length) {
+      for (const tk of extraDoneTasks) {
+        if (tk && tk.id && idSet.has(tk.id) && !moved.some(function (m) { return m.id === tk.id; })) {
+          moved.push(Object.assign({}, tk, { status: newStatus }));
+        }
+      }
+    }
+    const dest = columns.find(function (c) { return c.name === newStatus; });
+    if (dest && moved.length) dest.tasks = moved.concat(dest.tasks);
+    return Object.assign({}, board, { columns });
+  }
+
+  // Generation gate for in-flight /board reads — used TWICE: once for the
+  // "Load more" done pages, once for first-page board reads. Both scope
+  // switches and membership mutations invalidate every outstanding token: a
+  // response fetched before the invalidation must never be applied —
+  // otherwise the old scope's page (potentially another tenant's) hangs on
+  // the new scope's freshly-cleared extra pages, a page built from
+  // pre-mutation server state resurrects a card the mutation just
+  // moved/deleted, or a pre-mutation first page overwrites the post-change
+  // board (ghost in the first done page). Pure state machine so the race
+  // decision is testable without React.
+  function createFetchGate() {
+    let generation = 0;
+    return {
+      current: function () { return generation; },
+      // Invalidate every outstanding request token (scope changed).
+      reset: function () { generation += 1; return generation; },
+      // May a response fetched under `token` still be applied?
+      accepts: function (token) { return token === generation; },
+    };
+  }
+
+  // Scope generation for failed-write restores: unlike the fetch gate above,
+  // ONLY a real scope switch (board / tenant filter / archive filter) bumps
+  // it — never a same-scope membership mutation or a WS event about another
+  // card. A failed membership write must put its still-done cards back into
+  // the held extra pages even when such a same-scope reset landed mid-flight;
+  // guarding the restore with the fetch-gate token would suppress it (every
+  // mutation/WS bump stales the token) and the card would vanish from the
+  // column until the next "Load more". Only a genuine scope change invalidates
+  // a restore: the new scope's extra pages were cleared on purpose, and
+  // injecting this scope's cards there would bleed them across scopes. Pure
+  // state machine so the decision is testable without React.
+  function createScopeGeneration() {
+    let generation = 0;
+    return {
+      current: function () { return generation; },
+      bump: function () { generation += 1; return generation; },
+      accepts: function (token) { return token === generation; },
+    };
+  }
+
   // Board column display order; any backend status not listed here renders after these.
   const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
@@ -697,6 +828,42 @@
     // the component keeps seeing one complete done column.
     const [extraDone, setExtraDone] = useState([]);
     const [doneLoading, setDoneLoading] = useState(false);
+    // Number of membership writes (moves / bulk status patches) currently in
+    // flight. Pagination stays blocked while this is > 0: a "Load more"
+    // dispatched inside the pre-commit window reads the OLD done_pagination
+    // total (the server still holds the card being moved) and its response —
+    // built from pre-write server state — would otherwise attach the moved
+    // card back as a ghost. Released in the write's .finally.
+    const doneWritesRef = useRef(0);
+    // In-flight fetches (both the "Load more" done pages and the first-page
+    // /board read) are token-gated: a response fetched before a scope switch
+    // or membership mutation must not be applied to the changed state (see
+    // gate below).
+    const donePageGateRef = useRef(null);
+    if (!donePageGateRef.current) donePageGateRef.current = createFetchGate();
+    const boardGateRef = useRef(null);
+    if (!boardGateRef.current) boardGateRef.current = createFetchGate();
+    // Failed-write restores are scoped by THIS generation, not by the fetch
+    // gate: the fetch gate is reset by every same-scope membership mutation
+    // and WS membership event, but a restore stays valid unless the board/
+    // tenant/archive scope itself changed (the new scope's extra pages were
+    // cleared on purpose — injecting this scope's cards there would bleed
+    // them across scopes).
+    const scopeGenRef = useRef(null);
+    if (!scopeGenRef.current) scopeGenRef.current = createScopeGeneration();
+    // Invalidate every in-flight /board read — first-page reads AND "Load
+    // more" pages — and release the loading lock. Runs on scope switches AND
+    // on membership mutations: a response fetched before a move/delete was
+    // built from the pre-mutation server state (with a pre-mutation offset)
+    // and may still contain the very card the mutation just removed —
+    // applying it would resurrect it as a ghost (in an extra page or in the
+    // first done page). The stale request's .finally can no longer release
+    // the done-loading lock (its token is stale), so this releases it here.
+    const invalidateBoardFetches = useCallback(function () {
+      boardGateRef.current.reset();
+      donePageGateRef.current.reset();
+      setDoneLoading(false);
+    }, []);
     const boardData = useMemo(function () {
       return withMergedDoneColumn(kanbanBoard, extraDone);
     }, [kanbanBoard, extraDone]);
@@ -743,58 +910,256 @@
     }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
     // --- fetch full board ---------------------------------------------------
+    // The first-page /board read is token-gated: a read started before a
+    // membership mutation or a scope switch was built from pre-change server
+    // state — applying it after the change would resurrect a just-moved card
+    // into the first done page (or hide a just-completed one). Discard the
+    // stale response; the invalidating change always dispatches a fresh read
+    // (scope effect, WS-debounced reload, post-commit refresh).
+    // `loading` is released unconditionally: it is the mount skeleton, not a
+    // concurrency lock (unlike doneLoading) — a discarded response must still
+    // unblock it or the skeleton would hang until the next read.
     const loadBoard = useCallback(() => {
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
+      const token = boardGateRef.current.current();
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
+          if (!boardGateRef.current.accepts(token)) return;  // stale read — discard
           setBoardData(data);
+          // Re-anchor the done-page consumption window in SERVER coordinates:
+          // this response's done_pagination says exactly which done window it
+          // represents. The response's total also advances the consistent
+          // totals source (doneTotalRef) the next "Load more" corrects its
+          // offset against.
+          //
+          // When extra pages are still held across this refresh, the anchor
+          // must NOT blindly reset to the first page's boundary: an unchanged
+          // window (same total, same first-page head) means the held extras
+          // still occupy exactly [boundary, prior.offset) — rewinding would
+          // make the next "Load more" re-fetch already-held pages, a rewind
+          // the merge's dedupe hides, so under ongoing refreshes the column
+          // would never page forward. Keep the anchor past the held extras.
+          // A CHANGED window, though, means the done list shifted and the
+          // held extras' server coordinates are unknown — re-anchor at the
+          // fresh boundary: everything below it is the fresh first page (no
+          // card can be skipped), cards that fell out of the replaced first
+          // page sit right past it and arrive on the next click, repeats are
+          // deduped by the merge.
+          const pg = data && data.done_pagination;
+          const freshIds = doneColumnIds(data);
+          if (pg && typeof pg.total === "number" && typeof pg.limit === "number") {
+            doneTotalRef.current = pg.total;
+            const boundary = Math.min(pg.total, (pg.offset || 0) + pg.limit);
+            const prior = doneConsumedRef.current;
+            const heldIds = firstPageDoneIdsRef.current;
+            const idsEqual = !!freshIds && !!heldIds
+              && freshIds.length === heldIds.length
+              && freshIds.every(function (id, i) { return id === heldIds[i]; });
+            const windowUnchanged = !!prior
+              && typeof prior.offset === "number" && typeof prior.total === "number"
+              && pg.total === prior.total
+              && idsEqual;
+            doneConsumedRef.current = (windowUnchanged
+              && typeof prior.offset === "number")
+              ? { offset: Math.max(boundary, prior.offset), total: pg.total }
+              : { offset: boundary, total: pg.total };
+          } else {
+            doneTotalRef.current = null;
+            doneConsumedRef.current = null;
+          }
+          // Remember THIS response's first-page head for the next refresh's
+          // window-unchanged check (load-more responses don't touch it —
+          // their done window is a deeper page, not the head).
+          firstPageDoneIdsRef.current = freshIds;
           cursorRef.current = data.latest_event_id || 0;
           setError(null);
         })
         .catch(function (err) {
+          if (!boardGateRef.current.accepts(token)) return;  // stale read — no banner
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived, board]);
 
+    // Post-op refreshes must never run the loadBoard closure captured at
+    // dispatch time: a write's .finally (a move/bulk/delete settling), a
+    // drawer/toolbar refresh or a debounced WS reload can fire after the
+    // user switched board/tenant/archive scope. The captured closure then
+    // rebuilds the OLD scope's query (potentially another tenant's board)
+    // and — because the post-commit invalidateBoardFetches() just bumped the
+    // gate — its response carries a fresh token and overwrites the new
+    // scope's board. Every deferred refresh therefore goes through
+    // refreshBoard(), which reads the LATEST loadBoard at call time.
+    const loadBoardRef = useRef(null);
+    useEffect(function () { loadBoardRef.current = loadBoard; });
+    const refreshBoard = useCallback(function () {
+      const fn = loadBoardRef.current || loadBoard;
+      return fn();
+    }, [loadBoard]);
+
+    // Server coordinates (offset + total) of the last APPLIED done page —
+    // first page or "Load more" — used to drift-correct the next load-more
+    // offset: the client-held card count silently desyncs from the server
+    // list while extra pages are frozen (a new completion inserts at the top
+    // and pushes every older card one position down; moves/archives pull
+    // them up) — an offset taken from the held count would then SKIP a
+    // still-done card between the fresh first page and the extras.
+    const doneConsumedRef = useRef(null);
+    // The done TOTAL as reported by the most recent ACCEPTED /board response
+    // (first page or "Load more" — both reflect server truth at their build
+    // time). This is the consistent totals source for the load-more delta:
+    // correcting against `kanbanBoard.done_pagination.total` instead would
+    // mix a stale first-page total with the anchor's fresh one — a phantom
+    // delta that makes every repeated click skip one still-done card (e.g. a
+    // foreign change BELOW the consumed window changes the server total
+    // without shifting any position the client holds). Reset with the anchor
+    // on scope change; advanced by every accepted response.
+    const doneTotalRef = useRef(null);
+    // Ids of the last accepted FIRST page's done column, in server order.
+    // The refresh anchor keeps the consumption window only when BOTH the
+    // total and this head are unchanged — a head change means the done list
+    // shifted (a completion pushes every held card down, a first-page
+    // departure pulls it up), and the held extras' server coordinates are
+    // then unknown: re-anchor at the fresh boundary (never skips a card).
+    const firstPageDoneIdsRef = useRef(null);
+    // Membership events per task id, counted as they arrive over the WS
+    // tailer. The failed-write restore compares the count captured at
+    // dispatch with the count at restore time: a membership event for the
+    // SAME id inside the write window means the server's done membership
+    // for that card changed while the write was in flight (a foreign
+    // archive/completion — the WS handler already pruned the frozen extra
+    // copy), and restoring the frozen copy would resurrect a ghost. Events
+    // about OTHER ids must not suppress this restore — hence a per-id
+    // count, not a single "something changed" flag.
+    const doneMembershipEventsRef = useRef({});
+
+    // Same window-guard class for LOCAL deletes: a DELETE that succeeded
+    // inside a failed-write's window leaves no WS event at all (the core
+    // hard-deletes the task without appending a task_event), so the
+    // membership counter above cannot see it. Successful deletes are
+    // counted per id here; a restore skips ids whose delete count changed
+    // since its dispatch — the deleted card is gone server-side and
+    // resurrecting the frozen extra copy would be a ghost. Failed deletes
+    // never count: the card still exists and the restore must still fire.
+    const doneDeletesRef = useRef({});
+
     // Extra done pages are fetched per board/filter scope — drop them when
     // the scope changes so stale pages from another board or filter never
-    // bleed into the merged done column.
+    // bleed into the merged done column. The scope generation bump also
+    // invalidates pending failed-write restores (a restore must not inject
+    // this scope's cards into the new scope's cleared extra pages), and the
+    // gate bump invalidates any in-flight /board response from the old scope.
     useEffect(function () {
+      scopeGenRef.current.bump();
+      invalidateBoardFetches();
       setExtraDone([]);
-      setDoneLoading(false);
-    }, [board, tenantFilter, includeArchived]);
+      // The consumption anchor and the known totals source belong to the old
+      // scope's list — reset them until the new scope's first page re-anchors
+      // both.
+      doneConsumedRef.current = null;
+      doneTotalRef.current = null;
+      firstPageDoneIdsRef.current = null;
+      // The window counters are per board+id (see doneWindowKey): a scope
+      // switch starts fresh window bookkeeping. Late successes from the old
+      // board keep landing under the OLD board's keys and can never touch
+      // the new scope's restore windows.
+      doneMembershipEventsRef.current = {};
+      doneDeletesRef.current = {};
+    }, [board, tenantFilter, includeArchived, invalidateBoardFetches]);
 
-    // Load the next page of the done column. The offset is how many done
-    // cards the client already holds (first page + extras); the server slices
-    // the same newest-completed-first ordering, so pages continue where the
-    // last one ended (small overlaps from concurrent completions are removed
-    // by the merge).
+    // Load the next page of the done column. The offset anchors on the last
+    // applied page's SERVER coordinates (doneConsumedRef), corrected by the
+    // done-total delta since that fetch — see the drift note below.
     const loadMoreDone = useCallback(function () {
-      if (!kanbanBoard || doneLoading) return Promise.resolve();
+      // Blocked while a membership write is in flight: the pre-commit window
+      // (dispatch → write settles) has no valid done_pagination to page on —
+      // the server still serves the card being moved at the old total.
+      if (!kanbanBoard || doneLoading || doneWritesRef.current > 0) return Promise.resolve();
       const pagination = kanbanBoard.done_pagination || null;
       const mergedNow = withMergedDoneColumn(kanbanBoard, extraDone).columns
         .find(function (c) { return c.name === "done"; });
       const paging = donePagingState(pagination, (mergedNow && mergedNow.tasks) || []);
       if (!paging.hasMore) return Promise.resolve();
+      // Drift-corrected offset: paging.loaded counts what the client HOLDS,
+      // but the server list shifts while the extra pages are frozen (a new
+      // card completing inserts at the top and pushes older cards down;
+      // moves/archives pull them up). An offset taken from the held count
+      // would then land PAST the card(s) that shifted into the region between
+      // the fresh first page and the frozen extras — a still-done card would
+      // never load (repeats are hidden by the merge, the gap is not). Anchor
+      // instead on the last applied page's server coordinates and correct by
+      // the total delta since: every membership change shifts the list below
+      // the consumed window by exactly (totalNow - totalAtFetch).
+      const consumed = doneConsumedRef.current;
+      // Consistent totals for the delta: BOTH numbers must come from the same
+      // response lineage. consumed.total is the total of the last applied
+      // page's response; doneTotalRef is the total of the most recent
+      // accepted response (that page or a later one). Correcting against
+      // kanbanBoard.done_pagination.total instead — the FIRST page's total,
+      // never advanced by the load-more path — mixes two different server
+      // epochs: any membership change between them (e.g. a foreign archive
+      // BELOW the consumed window, which changes the total without shifting
+      // a single position the client holds) becomes a phantom delta, and
+      // every repeated click then skips one still-done card.
+      const knownTotal = doneTotalRef.current;
+      let requestOffset = paging.loaded;
+      if (consumed && typeof knownTotal === "number"
+        && typeof consumed.total === "number" && typeof consumed.offset === "number") {
+        requestOffset = Math.max(0, consumed.offset + (knownTotal - consumed.total));
+      }
+      // Token for this request; the gate is bumped on every scope change AND
+      // on every membership mutation, so a response that lands after either
+      // is discarded.
+      const token = donePageGateRef.current.current();
       const qs = new URLSearchParams();
-      qs.set("done_offset", String(paging.loaded));
+      qs.set("done_offset", String(requestOffset));
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       setDoneLoading(true);
       return SDK.fetchJSON(withBoard(`${API}/board?${qs}`, board))
         .then(function (data) {
+          if (!donePageGateRef.current.accepts(token)) return;  // stale scope — discard
           const doneCol = ((data && data.columns) || []).find(function (c) { return c.name === "done"; });
           const page = (doneCol && doneCol.tasks) || [];
-          setExtraDone(function (prev) { return prev.concat(page); });
+          // Append only ids not already held (shared dedupe-append helper):
+          // the drift correction above intentionally re-requests a small
+          // overlap with the held pages — duplicates must not pile up in the
+          // extras, or the paging math ("X von Y geladen") drifts too.
+          setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, page); });
+          // Re-anchor the consumption window at THIS response's coordinates,
+          // advance the consistent totals source, and write the fresh
+          // done_pagination back into the board state — the paging math
+          // ("X von Y geladen", hasMore) reads kanbanBoard.done_pagination,
+          // and leaving it at the first page's stale total would desync both
+          // after any membership change.
+          const pg = data && data.done_pagination;
+          if (pg && typeof pg.total === "number") {
+            doneTotalRef.current = pg.total;
+            setBoardData(function (b) {
+              return (b && b.done_pagination !== pg)
+                ? Object.assign({}, b, { done_pagination: pg })
+                : b;
+            });
+            doneConsumedRef.current = {
+              offset: Math.min(pg.total, (typeof pg.offset === "number" ? pg.offset : requestOffset) + page.length),
+              total: pg.total,
+            };
+          }
         })
         .catch(function (err) {
+          if (!donePageGateRef.current.accepts(token)) return;  // stale scope — no banner
           setError(String(err && err.message ? err.message : err));
         })
-        .finally(function () { setDoneLoading(false); });
+        .finally(function () {
+          // A stale request must not release the loading lock of the new
+          // scope: the reset effect cleared doneLoading on scope change and
+          // a fresh "Load more" may already hold it — releasing it here
+          // would allow two concurrent fetches for the same offset.
+          if (donePageGateRef.current.accepts(token)) setDoneLoading(false);
+        });
     }, [kanbanBoard, extraDone, doneLoading, tenantFilter, includeArchived, board]);
 
     // --- load list of boards for the switcher ------------------------------
@@ -825,9 +1190,13 @@
       if (reloadTimerRef.current) return;
       reloadTimerRef.current = setTimeout(function () {
         reloadTimerRef.current = null;
-        loadBoard();
+        // refreshBoard, not the captured loadBoard: a debounce timer can
+        // outlive a scope switch — the stale closure would rebuild the old
+        // scope's query under a fresh gate token and overwrite the new
+        // scope's board with it.
+        refreshBoard();
       }, 250);
-    }, [loadBoard]);
+    }, [refreshBoard]);
 
     useEffect(function () {
       loadBoard();
@@ -843,6 +1212,23 @@
     useEffect(function () {
       if (!boardData) return undefined;
       wsClosedRef.current = false;
+      // The socket is pinned to THIS board (wsParams.board below); its
+      // membership counter keys carry the same board (doneWindowKey) so a
+      // message still in flight from a PREVIOUS board's socket cannot
+      // contaminate the new board's restore windows. The socket lifecycle is
+      // bound to the WHOLE filter scope (board, tenant, archive — see the
+      // effect deps below): the scope reset effect bumps the generation for
+      // all three, so the socket must re-open with them and capture a FRESH
+      // scope token. Bound to the board alone, a surviving socket's token
+      // would go stale at the first tenant/archive filter change and the
+      // guard would then discard every membership frame of the still-running
+      // socket — valid updates suppressed, ghosts surviving until the next
+      // board switch. The generation is still captured per socket run: a
+      // frame still in flight from THIS socket when the scope switches
+      // (close() is asynchronous — already-received frames still flush to
+      // onmessage) must not prune or invalidate the NEW scope's state below.
+      const wsBoard = board;
+      const wsScopeGen = scopeGenRef.current.current();
       function openWs() {
         if (wsClosedRef.current) return;
         // Build the WS URL via the host SDK so the correct auth param is used
@@ -870,6 +1256,55 @@
               const msg = JSON.parse(ev.data);
               if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
                 cursorRef.current = msg.cursor || cursorRef.current;
+                // Membership events change board membership server-side (a
+                // task enters or leaves the done column): the dashboard's own
+                // status PATCH and the reopen cascade append `status`, a
+                // FOREIGN client's completion/archive appends `completed` /
+                // `archived` (kanban_db complete_task/archive_task). A "Load
+                // more" response built before the change would attach its
+                // pre-event page after the refresh — discard it immediately,
+                // before the debounced reload. Non-membership events (edited,
+                // comment, …) leave in-flight pagination alone.
+                let membershipChanged = false;
+                const membershipTaskIds = [];
+                for (const e of msg.events) {
+                  if (e && DONE_MEMBERSHIP_EVENT_KINDS.has(e.kind)) {
+                    membershipChanged = true;
+                    if (e.task_id) {
+                      membershipTaskIds.push(e.task_id);
+                      // Count per id — the failed-write restore reads this
+                      // to detect a membership change for a SPECIFIC id
+                      // inside its write window (see doneMembershipEventsRef).
+                      doneMembershipEventsRef.current[doneWindowKey(wsBoard, e.task_id)] =
+                        (doneMembershipEventsRef.current[doneWindowKey(wsBoard, e.task_id)] || 0) + 1;
+                    }
+                  }
+                }
+                if (membershipChanged) {
+                  // The event also names the moved cards: drop them from the
+                  // held extra pages NOW. The debounced reload replaces only
+                  // the first page (`kanbanBoard`); a card that lived in an
+                  // extra page would otherwise be merged back into the done
+                  // column as a ghost. A card that ENTERED done comes back
+                  // through the fresh first page — its stale extra copy (old
+                  // status) must go for the same reason.
+                  // Scope-guarded: a frame still in flight from a PREVIOUS
+                  // scope's socket (see wsScopeGen) belongs to the old scope
+                  // — ids collide across boards, so its raw-id prune would
+                  // erase the NEW board's still-done same-id card from the
+                  // held extras. Counting above stays unconditional: the
+                  // counters are board-keyed (doneWindowKey) and a stale
+                  // board's counts are dead data (the scope reset emptied the
+                  // restore windows they could close).
+                  if (scopeGenRef.current.accepts(wsScopeGen)) {
+                    if (membershipTaskIds.length) {
+                      setExtraDone(function (prev) {
+                        return pruneExtraDoneTasks(prev, new Set(membershipTaskIds));
+                      });
+                    }
+                    invalidateBoardFetches();
+                  }
+                }
                 // Stamp per-task signal so the TaskDrawer can reload itself.
                 setTaskEventTick(function (prev) {
                   const next = Object.assign({}, prev);
@@ -907,7 +1342,7 @@
         wsClosedRef.current = true;
         try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
       };
-    }, [!!boardData, board, scheduleReload]);
+    }, [!!boardData, board, tenantFilter, includeArchived, scheduleReload, invalidateBoardFetches]);
 
     // --- filtering ----------------------------------------------------------
     const filteredBoard = useMemo(function () {
@@ -953,70 +1388,175 @@
         : patch;
       if (count > 1) {
         // Bulk path: optimistic UI prepends all moved tasks to dest column.
-        setBoardData(function (b) {
-          if (!b) return b;
-          const moved = [];
-          const columns = b.columns.map(function (col) {
-            const kept = [];
-            for (const tk of col.tasks) {
-              if (selectedIds.has(tk.id)) moved.push(Object.assign({}, tk, { status: newStatus }));
-              else kept.push(tk);
-            }
-            return Object.assign({}, col, { tasks: kept });
-          });
-          const dest = columns.find(function (c) { return c.name === newStatus; });
-          if (dest) dest.tasks = moved.concat(dest.tasks);
-          return Object.assign({}, b, { columns });
-        });
+        // Cards that lived only in a loaded done page must also leave the
+        // held extras, or the merge resurrects them as ghosts.
+        setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, selectedIds); });
+        invalidateBoardFetches();
+        // Pagination stays blocked until the write settles (doneWritesRef):
+        // a "Load more" dispatched in the pre-commit window reads the old
+        // done_pagination total — the server still holds these cards in done
+        // — and would attach them back after the move.
+        doneWritesRef.current += 1;
+        setBoardData(function (b) { return withOptimisticMove(b, selectedIds, newStatus, extraDone); });
         const ids = Array.from(selectedIds);
+        // Scope generation captured AFTER the dispatch-time invalidation: the
+        // failed-write restore below must not fire if the SCOPE changed while
+        // the write was in flight — the new scope's extraDone was cleared on
+        // purpose, and injecting this scope's cards there would bleed them
+        // across scopes. Same-scope gate bumps (other mutations, WS events
+        // about other cards) must NOT suppress the restore: the card is still
+        // done and would otherwise vanish until the next "Load more".
+        const writeScopeGen = scopeGenRef.current.current();
+        const dispatchedExtra = extraDone;
+        // Per-id membership-event counts at dispatch: the restore below
+        // skips ids whose done membership changed via WS while the write
+        // was in flight (see doneMembershipEventsRef).
+        const membershipCountAtDispatch = {};
+        for (const id of ids) {
+          membershipCountAtDispatch[id] = doneMembershipEventsRef.current[doneWindowKey(board, id)] || 0;
+        }
+        // Same window guard for LOCAL deletes (see doneDeletesRef): a
+        // delete that succeeded inside this write window leaves no WS
+        // event — the restore must not resurrect a deleted card. Both
+        // counters are board-keyed (see doneWindowKey): a late delete
+        // success from ANOTHER board's in-flight write must not close this
+        // board's window for a colliding id.
+        const deleteCountAtDispatch = {};
+        for (const id of ids) {
+          deleteCountAtDispatch[id] = doneDeletesRef.current[doneWindowKey(board, id)] || 0;
+        }
+        const restoreFailedExtras = function (failedIdSet) {
+          if (!failedIdSet || failedIdSet.size === 0) return;
+          if (!scopeGenRef.current.accepts(writeScopeGen)) return;
+          const tasks = dispatchedExtra.filter(function (tk) {
+            if (!tk || !tk.id || !failedIdSet.has(tk.id)) return false;
+            // A membership event for THIS id inside the write window means
+            // the server's done membership changed under the frozen copy
+            // (e.g. a foreign archive) — the WS prune already removed it,
+            // restoring it would resurrect a ghost.
+            return (doneMembershipEventsRef.current[doneWindowKey(board, tk.id)] || 0) === membershipCountAtDispatch[tk.id]
+              && (doneDeletesRef.current[doneWindowKey(board, tk.id)] || 0) === deleteCountAtDispatch[tk.id];
+          });
+          if (tasks.length) {
+            setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
+          }
+        };
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(Object.assign({ ids: ids }, finalPatch)),
         }).then(function (res) {
+          const okIds = (res.results || []).filter(function (r) { return r.ok; }).map(function (r) { return r.id; });
+          if (okIds.length > 0 && scopeGenRef.current.accepts(writeScopeGen)) {
+            // Successfully written ids have left done server-side — keep the
+            // held extra pages free of them (belt and braces beside the
+            // dispatch-time prune above). Scope-guarded: a board switch while
+            // the bulk write is in flight must not prune the NEW scope's
+            // extra pages — ids collide across boards, a raw-id prune would
+            // erase the new board's still-done same-id cards.
+            setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(okIds)); });
+          }
           const failed = (res.results || []).filter(function (r) { return !r.ok; });
           if (failed.length > 0) {
             setError(`Bulk move: ${failed.length} of ${res.results.length} failed`);
             setFailedIds(new Set(failed.map(function (f) { return f.id; })));
+            // Failed writes never left done server-side — put their cards
+            // back into the held extra pages they were pruned from at
+            // dispatch, or they vanish from the column despite their
+            // still-valid done membership.
+            restoreFailedExtras(new Set(failed.map(function (f) { return f.id; })));
           } else {
             setFailedIds(new Set());
           }
           setSelectedIds(new Set());
           setLastSelectedId(null);
-          loadBoard();
         }).catch(function (err) {
           setError(`Move failed: ${err.message || err}`);
           setFailedIds(new Set(selectedIds));
-          loadBoard();
+          // Whole request failed: every selected card is still done
+          // server-side — restore all of them to the held extra pages.
+          restoreFailedExtras(selectedIds);
+        }).finally(function () {
+          // Post-commit invalidation: re-bump the gates (nothing can be in
+          // flight — pagination was blocked for the whole window) and
+          // release the loading lock. The refresh read is dispatched AFTER
+          // the bump so it runs under the new generation — a read dispatched
+          // before it would carry a stale token and its response (built from
+          // pre-write server state) would be discarded. refreshBoard (not
+          // the dispatch-time loadBoard): if the scope changed while the
+          // write was in flight, the captured closure would rebuild the OLD
+          // scope's query and overwrite the new scope's board with it.
+          doneWritesRef.current -= 1;
+          invalidateBoardFetches();
+          refreshBoard();
         });
         return;
       }
       // Single-task path.
-      setBoardData(function (b) {
-        if (!b) return b;
-        let moved = null;
-        const columns = b.columns.map(function (col) {
-          const next = col.tasks.filter(function (tk) {
-            if (tk.id === taskId) { moved = Object.assign({}, tk, { status: newStatus }); return false; }
-            return true;
-          });
-          return Object.assign({}, col, { tasks: next });
-        });
-        if (moved) {
-          const dest = columns.find(function (c) { return c.name === newStatus; });
-          if (dest) dest.tasks = [moved].concat(dest.tasks);
-        }
-        return Object.assign({}, b, { columns });
-      });
+      setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+      invalidateBoardFetches();
+      doneWritesRef.current += 1;
+      setBoardData(function (b) { return withOptimisticMove(b, new Set([taskId]), newStatus, extraDone); });
+      // Same scope generation as the bulk path: a failed PATCH restores the
+      // card into the held extras unless the scope itself changed.
+      const writeScopeGen = scopeGenRef.current.current();
+      const dispatchedExtra = extraDone;
+      // Membership-event count for THIS id at dispatch: a WS membership
+      // event for the same id inside the write window means the server's
+      // done membership changed under the frozen copy (foreign archive/
+      // completion) — the restore must not resurrect it (see
+      // doneMembershipEventsRef). Board-keyed (see doneWindowKey): events
+      // from another board's socket must not close this board's window.
+      const membershipCountAtDispatch = doneMembershipEventsRef.current[doneWindowKey(board, taskId)] || 0;
+      // Same window guard for LOCAL deletes (see doneDeletesRef): a delete
+      // that succeeded inside this write window leaves no WS event — the
+      // restore must not resurrect a card that no longer exists. Board-keyed
+      // too: a late delete success from ANOTHER board's in-flight write must
+      // not close this board's window for a colliding id.
+      const deleteCountAtDispatch = doneDeletesRef.current[doneWindowKey(board, taskId)] || 0;
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(finalPatch),
+      }).then(function () {
+        // The card has left done server-side — keep it out of the held extra
+        // pages (belt and braces beside the dispatch-time prune above).
+        // Scope-guarded like the delete success prune: a board switch while
+        // the PATCH is in flight must not prune the NEW scope's extra pages —
+        // ids collide across boards (one kanban_db file per board), so a raw
+        // -id prune would erase the new board's still-done same-id card.
+        if (scopeGenRef.current.accepts(writeScopeGen)) {
+          setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+        }
       }).catch(function (err) {
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
-        loadBoard();
+        // The write failed: the card is still done server-side and may live
+        // beyond the first page — put it back into the held extra pages it
+        // was optimistically pruned from at dispatch. Skipped when a WS
+        // membership event for this id arrived inside the write window: the
+        // server's done membership changed under the frozen copy and the WS
+        // prune already removed it (restoring would resurrect a ghost).
+        if (scopeGenRef.current.accepts(writeScopeGen)
+            && (doneMembershipEventsRef.current[doneWindowKey(board, taskId)] || 0) === membershipCountAtDispatch
+            && (doneDeletesRef.current[doneWindowKey(board, taskId)] || 0) === deleteCountAtDispatch) {
+          const restoreTasks = dispatchedExtra.filter(function (tk) {
+            return tk && tk.id === taskId;
+          });
+          if (restoreTasks.length) {
+            setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, restoreTasks); });
+          }
+        }
+      }).finally(function () {
+        // Post-commit invalidation: re-bump the gates and release the loading
+        // lock — pagination is usable again only after the write settled.
+        // Refresh read AFTER the bump (new generation), same as the bulk
+        // path; refreshBoard (not the dispatch-time loadBoard) so a scope
+        // switch during the write refreshes the NEW scope, never the old one.
+        doneWritesRef.current -= 1;
+        invalidateBoardFetches();
+        refreshBoard();
       });
-    }, [loadBoard, board, t, selectedIds]);
+    }, [refreshBoard, board, t, selectedIds, extraDone, invalidateBoardFetches]);
 
     // Pre-dispatch dialog step for both moveTask and moveSelected. Drives
     // the new in-app ConfirmDialog instead of window.confirm. The flow:
@@ -1117,11 +1657,11 @@
         if (res && res.warning) {
           setError(tx(t, "taskCreatedWarning", "Task created, but: ") + res.warning);
         }
-        loadBoard();
+        refreshBoard();
         loadBoardList();  // refresh counts in the switcher
         return res;
       });
-    }, [loadBoard, loadBoardList, board, t]);
+    }, [refreshBoard, loadBoardList, board, t]);
 
     const toggleSelected = useCallback(function (id, additive) {
       setSelectedIds(function (prev) {
@@ -1203,47 +1743,115 @@
       const run = function () {
         const finalPatch = patch;
         const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
-        // Optimistic UI for status moves (same pattern as moveSelected).
-        if (finalPatch.status) {
-          setBoardData(function (b) {
-            if (!b) return b;
-            const moved = [];
-            const columns = b.columns.map(function (col) {
-              const kept = [];
-              for (const t of col.tasks) {
-                if (selectedIds.has(t.id)) moved.push(Object.assign({}, t, { status: finalPatch.status }));
-                else kept.push(t);
-              }
-              return Object.assign({}, col, { tasks: kept });
-            });
-            const dest = columns.find(function (c) { return c.name === finalPatch.status; });
-            if (dest) dest.tasks = moved.concat(dest.tasks);
-            return Object.assign({}, b, { columns });
-          });
+        // Status AND archive:true change done membership server-side (an
+        // archived done card leaves the column, plugin_api bulk handler
+        // archive_task) — same ghost-card guard as performMoveTask: the
+        // moved cards must also leave the held extra done pages.
+        const changesDoneMembership = !!finalPatch.status || finalPatch.archive === true;
+        if (changesDoneMembership) {
+          setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, selectedIds); });
+          invalidateBoardFetches();
+          // Pagination stays blocked until the write settles (doneWritesRef),
+          // same pre-commit-window guard as performMoveTask.
+          doneWritesRef.current += 1;
+          if (finalPatch.status) {
+            setBoardData(function (b) { return withOptimisticMove(b, selectedIds, finalPatch.status, extraDone); });
+          }
         }
+        // Same failed-write restore as performMoveTask: a failed id never left
+        // done server-side, so its card goes back into the held extra pages —
+        // only while still in the dispatch SCOPE (scope generation captured
+        // after the dispatch-time invalidation; same-scope gate bumps from
+        // other mutations/WS events must not suppress the restore).
+        const writeScopeGen = scopeGenRef.current.current();
+        const dispatchedExtra = extraDone;
+        // Per-id membership-event counts at dispatch: the restore below
+        // skips ids whose done membership changed via WS while the write
+        // was in flight (see doneMembershipEventsRef).
+        const membershipCountAtDispatch = {};
+        for (const id of Array.from(selectedIds)) {
+          membershipCountAtDispatch[id] = doneMembershipEventsRef.current[doneWindowKey(board, id)] || 0;
+        }
+        // Same window guard for LOCAL deletes (see doneDeletesRef): a
+        // delete that succeeded inside this write window leaves no WS
+        // event — the restore must not resurrect a deleted card. Both
+        // counters are board-keyed (see doneWindowKey): a late delete
+        // success from ANOTHER board's in-flight write must not close this
+        // board's window for a colliding id.
+        const deleteCountAtDispatch = {};
+        for (const id of Array.from(selectedIds)) {
+          deleteCountAtDispatch[id] = doneDeletesRef.current[doneWindowKey(board, id)] || 0;
+        }
+        const restoreFailedExtras = function (failedIdSet) {
+          if (!changesDoneMembership) return;
+          if (!failedIdSet || failedIdSet.size === 0) return;
+          if (!scopeGenRef.current.accepts(writeScopeGen)) return;
+          const tasks = dispatchedExtra.filter(function (tk) {
+            if (!tk || !tk.id || !failedIdSet.has(tk.id)) return false;
+            // A membership event for THIS id inside the write window means
+            // the server's done membership changed under the frozen copy
+            // (e.g. a foreign archive) — the WS prune already removed it,
+            // restoring it would resurrect a ghost.
+            return (doneMembershipEventsRef.current[doneWindowKey(board, tk.id)] || 0) === membershipCountAtDispatch[tk.id]
+              && (doneDeletesRef.current[doneWindowKey(board, tk.id)] || 0) === deleteCountAtDispatch[tk.id];
+          });
+          if (tasks.length) {
+            setExtraDone(function (prev) { return restoreExtraDoneTasks(prev, tasks); });
+          }
+        };
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         })
           .then(function (res) {
+            if (changesDoneMembership) {
+              const okIds = (res.results || []).filter(function (r) { return r.ok; }).map(function (r) { return r.id; });
+              if (okIds.length > 0 && scopeGenRef.current.accepts(writeScopeGen)) {
+                // Successfully written ids have left done server-side — keep
+                // the held extra pages free of them (same belt-and-braces
+                // prune as performMoveTask). Scope-guarded: a board switch
+                // while the write is in flight must not prune the NEW scope's
+                // extra pages — ids collide across boards, a raw-id prune
+                // would erase the new board's still-done same-id cards.
+                setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(okIds)); });
+              }
+            }
             const failed = (res.results || []).filter(function (r) { return !r.ok; });
             if (failed.length > 0) {
               setError(tx(t, "bulkFailed", "Bulk: ") +
                 `${failed.length} of ${res.results.length} failed: ` +
                 failed.slice(0, 3).map(function (f) { return `${f.id} (${f.error})`; }).join("; "));
               setFailedIds(new Set(failed.map(function (f) { return f.id; })));
+              // Failed ids kept their done membership server-side — restore
+              // their cards to the held extra pages.
+              restoreFailedExtras(new Set(failed.map(function (f) { return f.id; })));
             } else {
               setFailedIds(new Set());
             }
             setSelectedIds(new Set());
             setLastSelectedId(null);
-            loadBoard();
           })
           .catch(function (e) {
             setError(String(e.message || e));
             setFailedIds(new Set(selectedIds));
-            loadBoard();
+            // Whole request failed: every selected card kept its done
+            // membership server-side — restore all of them.
+            restoreFailedExtras(selectedIds);
+          })
+          .finally(function () {
+            // Post-commit invalidation — mirrors performMoveTask: only when
+            // the write settled is pagination unblocked and the lock released.
+            // The refresh read is dispatched AFTER the bump so it runs under
+            // the new generation (also covers the non-membership case, which
+            // needs the refresh but no gate bump). refreshBoard (not the
+            // dispatch-time loadBoard) keeps a scope switch during the write
+            // from re-applying the old scope's board.
+            if (changesDoneMembership) {
+              doneWritesRef.current -= 1;
+              invalidateBoardFetches();
+            }
+            refreshBoard();
           });
       };
       if (!confirmMsg) {
@@ -1259,7 +1867,7 @@
       }).then(function (r) {
         if (r.confirmed) run();
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, loadBoard, board, t, kanbanDialogs]);
+    }, [selectedIds, refreshBoard, board, t, kanbanDialogs, extraDone, invalidateBoardFetches]);
 
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
@@ -1325,11 +1933,32 @@
        confirmLabel: tx(t, "common.delete", "Delete"),
        destructive: true,
      }).then(function (r) {
-       if (!r.confirmed) return null;
-       return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
-         method: "DELETE",
-       }).then(function () {
-         loadBoard();
+      if (!r.confirmed) return null;
+      // Scope generation at dispatch: the success handler below prunes and
+      // invalidates for THIS board's scope only. A board switch while the
+      // DELETE is in flight must not prune the NEW scope's extra pages —
+      // ids collide across boards (one kanban_db file per board), so a raw
+      // -id prune would erase the new board's still-done same-id card.
+      const deleteScopeGen = scopeGenRef.current.current();
+      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
+        method: "DELETE",
+      }).then(function () {
+        // Count the successful delete per id (see doneDeletesRef): the
+        // failed-write restores must not resurrect this card if one of
+        // their windows overlaps this delete. Board-keyed (see
+        // doneWindowKey): the count belongs to THIS board's db and can
+        // never close another board's restore window for a colliding id.
+        const deleteKey = doneWindowKey(board, taskId);
+        doneDeletesRef.current[deleteKey] = (doneDeletesRef.current[deleteKey] || 0) + 1;
+        if (scopeGenRef.current.accepts(deleteScopeGen)) {
+          // Deleted cards must also leave the held extra done pages, or the
+          // merge resurrects them (same ghost-card class as moves). refreshBoard
+          // (not the dispatch-time loadBoard): a scope switch while the DELETE
+          // was in flight must refresh the NEW scope.
+          setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+          invalidateBoardFetches();
+        }
+        refreshBoard();
          setSelectedIds(function (prev) {
            const next = new Set(prev);
            next.delete(taskId);
@@ -1337,7 +1966,7 @@
          });
        }).catch(function (e) { setError(String(e.message || e)); });
      }).catch(function () { /* cancelled */ });
-   }, [board, loadBoard, t, kanbanDialogs]);
+   }, [board, refreshBoard, t, kanbanDialogs, invalidateBoardFetches]);
 
     const deleteSelected = useCallback(function (count) {
       if (selectedIds.size === 0) return Promise.resolve();
@@ -1349,15 +1978,77 @@
         destructive: true,
       }).then(function (r) {
         if (!r.confirmed) return null;
+        // Scope generation at dispatch: the success handler prunes and
+        // invalidates for THIS board's scope only — a board switch while a
+        // DELETE is in flight must not prune the NEW scope's extra pages
+        // (ids collide across boards, see doneWindowKey).
+        const deleteScopeGen = scopeGenRef.current.current();
         const ids = Array.from(selectedIds);
         setSelectedIds(new Set());
-        return Promise.all(ids.map(function (id) {
-          return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
-        })).then(function () {
-          loadBoard();
+        // Partial success must still count: one failing DELETE must not
+        // abandon the ids that were actually deleted — they would linger
+        // in the held extra done pages as ghosts (and no refresh would
+        // clear them). Settle every delete, prune the successes, refresh,
+        // and surface the failures.
+        return Promise.allSettled(ids.map(function (id) {
+          return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(id)}`, board), { method: "DELETE" });
+        })).then(function (results) {
+          const deletedIds = [];
+          const failed = [];
+          results.forEach(function (res, i) {
+            if (res.status === "fulfilled") {
+              deletedIds.push(ids[i]);
+              // Count the successful delete per id (see doneDeletesRef):
+              // failed-write restores must not resurrect this card if one
+              // of their windows overlaps this delete. Board-keyed (see
+              // doneWindowKey): the count belongs to THIS board's db and
+              // can never close another board's restore window.
+              const deleteKey = doneWindowKey(board, ids[i]);
+              doneDeletesRef.current[deleteKey] = (doneDeletesRef.current[deleteKey] || 0) + 1;
+            }
+            else failed.push({ id: ids[i], error: res.reason });
+          });
+          if (deletedIds.length && scopeGenRef.current.accepts(deleteScopeGen)) {
+            setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set(deletedIds)); });
+            invalidateBoardFetches();
+            refreshBoard();
+          }
+          else if (deletedIds.length) {
+            // Old-scope successes still trigger the (scope-fresh) refresh;
+            // only the prune/invalidation is bound to the dispatch scope.
+            refreshBoard();
+          }
+          if (failed.length) {
+            const first = failed[0].error;
+            setError(String(first && first.message ? first.message : first));
+          }
         }).catch(function (e) { setError(String(e.message || e)); });
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, board, loadBoard, t, kanbanDialogs]);
+    }, [selectedIds, board, refreshBoard, t, kanbanDialogs, invalidateBoardFetches]);
+
+    // A drawer patch that changes a task's status (complete / archive /
+    // unblock — every drawer status action rides one PATCH with a `status`
+    // key) can move a card out of the done column. Same ghost class as the
+    // move paths: the card may live only in a held extra page, so it must
+    // leave it — the merge would otherwise resurrect it after the refresh.
+    // Patches without a membership key (title, priority, assignee, …) keep
+    // the held page: the card stays done and must stay visible.
+    // The third argument is the dispatch-time scope generation (captured by
+    // the drawer via `captureScopeGen` when it issued the PATCH): a board
+    // switch while the PATCH is in flight must not let the late success
+    // prune the NEW scope's extra pages — ids collide across boards (one
+    // kanban_db file per board), a raw-id prune would erase the new board's
+    // still-done same-id card. Missing token (no captureScopeGen wired)
+    // keeps the old behavior — the guard only tightens when a token exists.
+    const handleDrawerTaskPatched = useCallback(function (taskId, patch, scopeGen) {
+      if (!patch) return;
+      const changesMembership = Object.prototype.hasOwnProperty.call(patch, "status")
+        || Object.prototype.hasOwnProperty.call(patch, "archived");
+      if (!changesMembership) return;
+      if (scopeGen != null && !scopeGenRef.current.accepts(scopeGen)) return;
+      setExtraDone(function (prev) { return pruneExtraDoneTasks(prev, new Set([taskId])); });
+      invalidateBoardFetches();
+    }, [invalidateBoardFetches]);
 
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {
@@ -1422,10 +2113,10 @@
           search, setSearch,
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
-              .then(loadBoard)
+              .then(refreshBoard)
               .catch(function (e) { setError(String(e.message || e)); });
           },
-          onRefresh: loadBoard,
+          onRefresh: refreshBoard,
         }),
        selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
@@ -1468,7 +2159,15 @@
           boardSlug: board,
           onClose: function () { setSelectedTaskId(null); },
           onOpenTask: setSelectedTaskId,
-          onRefresh: loadBoard,
+          onRefresh: refreshBoard,
+          onTaskPatched: handleDrawerTaskPatched,
+          // Dispatch-time scope-generation capture for the drawer's PATCH
+          // paths: the drawer stamps every onTaskPatched callback with the
+          // generation that was current when the PATCH was issued, so the
+          // parent prune above can drop late successes from a switched-away
+          // scope (same-id collision across boards — see
+          // handleDrawerTaskPatched).
+          captureScopeGen: function () { return scopeGenRef.current.current(); },
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
           assignees: (boardData && boardData.assignees) || [],
@@ -1661,11 +2360,22 @@
 
   function DiagnosticCard(props) {
     const { t } = useI18n();
-    const { diag, task, boardSlug, assignees, onRefresh } = props;
+    const { diag, task, boardSlug, assignees, onRefresh, onTaskPatched, captureScopeGen } = props;
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState(null);
     const [copiedKey, setCopiedKey] = useState(null);
     const [reassignProfile, setReassignProfile] = useState(task.assignee || "");
+
+    // Unblock / reclaim / reassign all flip the task's status to `ready`
+    // server-side. If the card lived in a held extra done page, the parent
+    // must drop it there (ghost guard — same class as the drawer PATCH).
+    // The parent prune is stamped with the dispatch-time scope generation:
+    // the token is captured when the action's request is ISSUED, so a board
+    // switch while it is in flight makes the late success a no-op in the
+    // NEW scope (ids collide across boards — see handleDrawerTaskPatched).
+    const noteStatusReady = function (scopeGen) {
+      if (onTaskPatched) onTaskPatched(task.id, { status: "ready" }, scopeGen);
+    };
 
     const execAction = function (action) {
       if (busy) return;
@@ -1710,6 +2420,8 @@
       }
       if (action.kind === "unblock") {
         setBusy(true); setMsg(null);
+        // Dispatch-time scope token (see noteStatusReady above).
+        const actionScopeGen = captureScopeGen ? captureScopeGen() : null;
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}`, boardSlug);
         SDK.fetchJSON(url, {
           method: "PATCH",
@@ -1718,6 +2430,9 @@
         }).then(function () {
           setMsg({ ok: true, text: tx(t, "unblockedMessage",
             "Unblocked {id}. Task is ready for the next tick.", { id: task.id }) });
+          // Parent invalidation FIRST — the refresh must read the NEW
+          // generation (see TaskDetail applyPatch).
+          noteStatusReady(actionScopeGen);
           if (onRefresh) onRefresh();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "unblockFailed", "Unblock failed: ") + (err.message || err) });
@@ -1726,6 +2441,8 @@
       }
       if (action.kind === "reclaim") {
         setBusy(true); setMsg(null);
+        // Dispatch-time scope token (see noteStatusReady above).
+        const actionScopeGen = captureScopeGen ? captureScopeGen() : null;
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/reclaim`, boardSlug);
         SDK.fetchJSON(url, {
           method: "POST",
@@ -1734,6 +2451,9 @@
         }).then(function () {
           setMsg({ ok: true, text: tx(t, "reclaimedMessage",
             "Reclaimed {id}. Task is back to ready.", { id: task.id }) });
+          // Parent invalidation FIRST — the refresh must read the NEW
+          // generation (see TaskDetail applyPatch).
+          noteStatusReady(actionScopeGen);
           if (onRefresh) onRefresh();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "reclaimFailed", "Reclaim failed: ") + (err.message || err) });
@@ -1746,6 +2466,8 @@
           return;
         }
         setBusy(true); setMsg(null);
+        // Dispatch-time scope token (see noteStatusReady above).
+        const actionScopeGen = captureScopeGen ? captureScopeGen() : null;
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/reassign`, boardSlug);
         const body = {
           profile: reassignProfile || null,
@@ -1762,6 +2484,9 @@
             text: tx(t, "reassignedMessage", "Reassigned {id} to {profile}.",
               { id: task.id, profile: reassignProfile }),
           });
+          // Parent invalidation FIRST — the refresh must read the NEW
+          // generation (see TaskDetail applyPatch).
+          noteStatusReady(actionScopeGen);
           if (onRefresh) onRefresh();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "reassignFailed", "Reassign failed: ") + (err.message || err) });
@@ -1890,6 +2615,8 @@
                 boardSlug: props.boardSlug,
                 assignees: props.assignees,
                 onRefresh: props.onRefresh,
+                onTaskPatched: props.onTaskPatched,
+                captureScopeGen: props.captureScopeGen,
               });
             }),
           )
@@ -3787,11 +4514,25 @@
         const finalPatch = withCompletionSummary(patch);
         if (!finalPatch) return Promise.resolve();
         setPatchErr(null);
+        // Dispatch-time scope generation: the parent prune (onTaskPatched
+        // below) is stamped with the scope that was current when THIS PATCH
+        // was issued — a board switch while it is in flight makes the late
+        // success a no-op in the NEW scope (ids collide across boards — see
+        // handleDrawerTaskPatched).
+        const patchScopeGen = props.captureScopeGen ? props.captureScopeGen() : null;
         return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(finalPatch),
-        }).then(function () { load(); props.onRefresh(); })
+        }).then(function () {
+          load();
+          // Parent invalidation FIRST (it may drop the card from the held
+          // extra pages and invalidate in-flight fetches) — the parent
+          // refresh below must read the NEW generation, or its response
+          // would be discarded as stale and the board would never refresh.
+          if (props.onTaskPatched) props.onTaskPatched(props.taskId, finalPatch, patchScopeGen);
+          props.onRefresh();
+        })
           .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); });
       }
     };
@@ -3949,6 +4690,8 @@
           onPatch: doPatch,
           onSpecify: doSpecify,
           onDecompose: doDecompose,
+          onTaskPatched: props.onTaskPatched,
+          captureScopeGen: props.captureScopeGen,
           onAddParent: addLink,
           onRemoveParent: removeLink,
           onAddChild: addChild,
@@ -4177,6 +4920,8 @@
         assignees: props.assignees,
         diagnostics: t.diagnostics || [],
         onRefresh: props.onRefresh,
+        onTaskPatched: props.onTaskPatched,
+        captureScopeGen: props.captureScopeGen,
       }),
       h(HomeSubsSection, {
         homeChannels: props.homeChannels || [],
@@ -5043,6 +5788,18 @@
       mergeDoneTasks: mergeDoneTasks,
       donePagingState: donePagingState,
       withMergedDoneColumn: withMergedDoneColumn,
+      pruneExtraDoneTasks: pruneExtraDoneTasks,
+      restoreExtraDoneTasks: restoreExtraDoneTasks,
+      doneWindowKey: doneWindowKey,
+      doneMembershipEventKinds: DONE_MEMBERSHIP_EVENT_KINDS,
+      withOptimisticMove: withOptimisticMove,
+      createFetchGate: createFetchGate,
+      createScopeGeneration: createScopeGeneration,
+      // Real drawer component — the lifecycle harness drives it directly
+      // (props-level observation cannot reach doPatch, which is internal).
+      TaskDrawer: TaskDrawer,
+      DiagnosticsSection: DiagnosticsSection,
+      DiagnosticCard: DiagnosticCard,
     };
   }
 })();
