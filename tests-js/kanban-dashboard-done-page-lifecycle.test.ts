@@ -1473,6 +1473,99 @@ describe('kanban dashboard done-page lifecycle (component harness)', () => {
     h.unmount()
   })
 
+  it('a WS deleted event (foreign hard delete) prunes a card held in an extra page (no ghost)', async () => {
+    const server = createServer()
+    const h = mount(server, { ws: true })
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1'])
+
+    // d2 is loaded into a held extra page.
+    h.boardColumnsProps().onLoadMoreDone()
+    await h.flush()
+    expect(h.doneIds()).toEqual(['d1', 'd2'])
+
+    // A FOREIGN client hard-deletes d2 (CLI or second dashboard tab). The
+    // core appends the `deleted` tombstone (kanban_db._append_delete_tombstone)
+    // — the task row is GONE server-side, so only the event can clear the
+    // held extra-page copy. Without the prune the card would stay as a ghost
+    // no client can ever remove.
+    const ws = h.wsInstances[0]
+
+    if (ws.onopen) { ws.onopen() }
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'deleted' }], cursor: 2 }) })
+    await h.flush()
+
+    expect(h.doneIds()).toEqual(['d1'])
+    h.unmount()
+  })
+
+  it('a WS deleted event closes the open drawer instead of reloading it (no GET /tasks/:id)', async () => {
+    const server = createServer()
+    const h = mount(server, { ws: true })
+    await h.flush()
+
+    // Open the drawer for a card. This harness invokes only top-level
+    // components, so the drawer's own detail GET is not recorded here —
+    // what IS observable is the drawer VNode (props) and every fetch the
+    // parent itself makes.
+    h.boardColumnsProps().onOpen('d2')
+    await h.flush()
+    expect(h.taskDrawerProps().taskId).toBe('d2')
+
+    // A FOREIGN client hard-deletes the OPEN task. The parent must close
+    // the drawer through the normal onClose path (unmount) instead of
+    // ticking it into a failing GET /tasks/:id (_require_task answers the
+    // deleted task with an error).
+    const ws = h.wsInstances[0]
+
+    if (ws.onopen) { ws.onopen() }
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'deleted' }], cursor: 2 }) })
+    await h.flush()
+
+    const drawerGone = (): boolean => {
+      try {
+        h.taskDrawerProps()
+
+        return false
+      } catch {
+        return true
+      }
+    }
+
+    expect(drawerGone()).toBe(true)
+
+    // No detail fetch was fired by the parent after the delete (the drawer
+    // reload path is eventTick-driven — the tick-skip is pinned by the
+    // next test together with the real drawer harness).
+    expect(h.callsTo('/tasks/d2').length).toBe(0)
+    h.unmount()
+  })
+
+  it('a WS deleted event does not stamp the open drawer eventTick (drawer for another task stays open, tick untouched)', async () => {
+    const server = createServer()
+    const h = mount(server, { ws: true })
+    await h.flush()
+
+    // Open the drawer for d1; the deleted event names a DIFFERENT task
+    // (d2): the drawer for d1 must stay open AND its eventTick prop must
+    // stay 0 — a stamped tick would push the real drawer (mountDrawer
+    // harness proves the tick-reload wiring) into a failing GET for the
+    // deleted task on the next open.
+    h.boardColumnsProps().onOpen('d1')
+    await h.flush()
+    expect(h.taskDrawerProps().taskId).toBe('d1')
+
+    const ws = h.wsInstances[0]
+
+    if (ws.onopen) { ws.onopen() }
+    ws.onmessage({ data: JSON.stringify({ events: [{ task_id: 'd2', kind: 'deleted' }], cursor: 2 }) })
+    await h.flush()
+
+    expect(h.taskDrawerProps().taskId).toBe('d1')
+    expect(h.taskDrawerProps().eventTick).toBe(0)
+    h.unmount()
+  })
+
   it('a WS completed event (foreign completion) invalidates an in-flight load-more', async () => {
     const server = createServer()
     server.setDeferLoadMore(true)

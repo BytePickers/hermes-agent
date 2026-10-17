@@ -704,7 +704,11 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert kb.get_task(conn, tid) is None
         assert conn.execute("SELECT COUNT(*) FROM task_links WHERE child_id = ? OR parent_id = ?", (tid, tid)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+        # The tombstone survives the task (task_events is append-only, no FK)
+        # — exactly one event remains and it is the delete marker.
+        rows = kb.list_events(conn, tid)
+        assert len(rows) == 1
+        assert rows[0].kind == "deleted"
         assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
@@ -717,8 +721,83 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert kb.delete_task(conn, t)
         assert kb.get_task(conn, t) is None
         assert len(kb.list_comments(conn, t)) == 0
-        assert len(kb.list_events(conn, t)) == 0
+        tombstones = kb.list_events(conn, t)
+        assert len(tombstones) == 1
+        assert tombstones[0].kind == "deleted"
         assert len(kb.list_runs(conn, t)) == 0
+
+
+# ---------------------------------------------------------------------------
+# Hard-delete tombstone (t_a6e89129): the dashboard WS tail reads task_events
+# without a kind filter, so a hard delete must leave exactly one `deleted`
+# event behind — otherwise a card held in a foreign client's extra done page
+# stays as a ghost. Old events are removed only AFTER the task DELETE verifiably
+# took (rowcount 1), all inside the same write_txn.
+# ---------------------------------------------------------------------------
+
+
+def test_delete_task_appends_deleted_tombstone(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="ghost-maker", assignee="alice")
+        kb.add_comment(conn, t, "user", "note")
+        kb.complete_task(conn, t, result="done")
+        before = [e.kind for e in kb.list_events(conn, t)]
+        assert "completed" in before
+        assert kb.delete_task(conn, t)
+        events = kb.list_events(conn, t)
+        assert len(events) == 1
+        assert events[0].kind == "deleted"
+        assert events[0].task_id == t
+
+
+def test_delete_archived_task_appends_deleted_tombstone(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="archived-ghost", assignee="bob")
+        kb.complete_task(conn, t, result="done")
+        assert kb.archive_task(conn, t)
+        assert kb.delete_archived_task(conn, t)
+        events = kb.list_events(conn, t)
+        assert len(events) == 1
+        assert events[0].kind == "deleted"
+        assert events[0].task_id == t
+
+
+def test_delete_archived_task_keeps_events_when_task_delete_fails(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="survivor", assignee="bob")
+        kb.add_comment(conn, t, "user", "keep my history")
+        kb.complete_task(conn, t, result="done")
+        assert kb.archive_task(conn, t)
+        before = kb.list_events(conn, t)
+        assert before
+        # Simulate a failing task DELETE: the statement silently affects 0
+        # rows (RAISE(IGNORE)), so the archived path must bail out BEFORE
+        # touching the old events — write_txn commits the plain return.
+        # Triggers cannot bind variables, so the generated task id goes in
+        # as a quoted literal.
+        conn.execute(
+            "CREATE TRIGGER block_delete BEFORE DELETE ON tasks "
+            f"WHEN OLD.id = '{t.replace(chr(39), chr(39) * 2)}' "
+            "BEGIN SELECT RAISE(IGNORE); END",
+        )
+        conn.commit()
+        assert kb.delete_archived_task(conn, t) is False
+        assert kb.get_task(conn, t) is not None
+        after = kb.list_events(conn, t)
+        assert [(e.kind, e.task_id) for e in after] == [(e.kind, e.task_id) for e in before]
+        assert not [e for e in after if e.kind == "deleted"]
+
+
+def test_delete_task_missing_leaves_events_untouched(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="stays", assignee="alice")
+        kb.add_comment(conn, t, "user", "note")
+        before = kb.list_events(conn, t)
+        assert kb.delete_task(conn, "nonexistent-task-id") is False
+        assert kb.get_task(conn, t) is not None
+        assert [(e.kind, e.task_id) for e in kb.list_events(conn, t)] == [
+            (e.kind, e.task_id) for e in before
+        ]
 
 
 

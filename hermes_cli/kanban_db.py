@@ -4096,15 +4096,36 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
+def _append_delete_tombstone(conn: sqlite3.Connection, task_id: str) -> None:
+    """Append a ``deleted`` event for a hard-deleted task, AFTER its old events
+    were removed. The row outlives the task (task_events is append-only and has
+    no FK): it is the only trace the delete exists, and the surfaces that tail
+    this table rely on it. Consumers — the dashboard WS tail
+    (plugin_api ``_EventTail``, no kind filter) treats it as a done-membership
+    change (prune held extra pages + invalidate in-flight pages, no ghost card
+    for a foreign delete); the gateway notifier's TERMINAL_KINDS deliberately
+    excludes ``deleted`` (a hard delete carries nothing to say in chat). Keep
+    both surfaces in mind when touching the event contract."""
+    _append_event(conn, task_id, "deleted", None)
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
-        _delete_task_relations(conn, task_id)
+        # Gate-A round-1 order: the task row goes FIRST and must actually be
+        # gone (rowcount 1) before any related rows — the old events included
+        # — are touched; write_txn commits a plain return, so removing the
+        # events before a verified task delete would strand a live card with
+        # no history and no tombstone.
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return False
+        _delete_task_relations(conn, task_id)
+        _append_delete_tombstone(conn, task_id)
+        return True
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4114,6 +4135,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         _delete_task_relations(conn, task_id)
+        _append_delete_tombstone(conn, task_id)
     recompute_ready(conn)
     return True
 
