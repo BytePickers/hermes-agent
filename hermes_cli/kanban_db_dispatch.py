@@ -88,6 +88,23 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A comment counts as the worker claiming the PR as ITS OWN work only when it
+# pairs the PR URL with an ownership verb. Patrol/escalation/evidence comments
+# that merely cite a PR URL (cross-references, review receipts, dashboards)
+# must not park a startable card for 24h (#117009 precedent: curated list, not
+# an open stem — prose like "the opened PR" in a report must not match).
+_RESPAWN_GUARD_PR_OWNERSHIP_RE = re.compile(
+    # "Änderungsantrag" etc.: the compound prefix must not defeat \bantrag\b.
+    r"(?:\b((?:\u00e4nderungs|erg\u00e4nzungs)?(?:pr|pull[\s_]?request|antrag|vorschlag))\s*"
+    r"([\w./-]*#\d+[\s:,-]*)?"
+    r"(ist\s+|wurde\s+|has\s+|was\s+|now\s+)?"
+    r"(ge\u00f6ffnet|geoeffnet|er\u00f6ffnet|eroeffnet|angelegt|erstellt|eingereicht|"
+    r"opened|created|filed|submitted|drafted)\b"
+    r"|(?:opened|created|filed|submitted|drafted)\s+"
+    r"(?:\bthe\s+)?(?:pr|pull[\s_]?request|antrag|vorschlag)\b)",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class DispatchResult:
@@ -1634,14 +1651,20 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    #    Only comments that CLAIM the PR as the worker's own work count
+    #    (ownership verb next to the URL); patrol/escalation/evidence comments
+    #    that merely cite a PR URL are references, not duplicate-work signals
+    #    (#117009 precedent: prose must not trip a curated-list guard).
+    #    Exception: a handoff AFTER the newest qualifying comment (operator
+    #    reassign, reviewer changes_requested, review reopen) names the profile
+    #    that must now work on THAT PR — a closer or the implementer finishing
+    #    it, not a duplicate implementation (#111910). A crash/reclaim is not a
+    #    handoff, so the worker that opened the PR is still not re-spawned
+    #    against it.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")
+                and _RESPAWN_GUARD_PR_OWNERSHIP_RE.search(_kb._lossy_text(c["body"]) or "")]
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
