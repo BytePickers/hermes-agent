@@ -191,8 +191,11 @@
   // commented, attached, …; `reclaimed` — reclaim_task refuses done tasks)
   // leaves done membership untouched and must NOT prune or invalidate: a
   // wrong prune makes a still-done extra-page card vanish until the next
-  // "Load more". Pure data; tested.
-  const DONE_MEMBERSHIP_EVENT_KINDS = new Set(["status", "completed", "archived"]);
+  // "Load more". `deleted` (the hard-delete tombstone, kanban_db
+  // _append_delete_tombstone) is a membership change too: the task row is
+  // GONE, so a card held in an extra done page must be pruned or it stays
+  // as a ghost a foreign delete can never clear. Pure data; tested.
+  const DONE_MEMBERSHIP_EVENT_KINDS = new Set(["status", "completed", "archived", "deleted"]);
 
   // Optimistic move shared by all move paths (single move, bulk move, bulk
   // patch): removes the moved ids from every column and prepends them (with
@@ -1279,7 +1282,9 @@
                 // comment, …) leave in-flight pagination alone.
                 let membershipChanged = false;
                 const membershipTaskIds = [];
+                const deletedTaskIds = [];
                 for (const e of msg.events) {
+                  if (e && e.kind === "deleted" && e.task_id) deletedTaskIds.push(e.task_id);
                   if (e && DONE_MEMBERSHIP_EVENT_KINDS.has(e.kind)) {
                     membershipChanged = true;
                     if (e.task_id) {
@@ -1314,6 +1319,15 @@
                         return pruneExtraDoneTasks(prev, new Set(membershipTaskIds));
                       });
                     }
+                    // A deleted event for the OPEN drawer closes it via the
+                    // normal onClose path instead of ticking it into a
+                    // failing GET /tasks/:id. Functional update so a stale
+                    // handler closure can never close the wrong drawer.
+                    if (deletedTaskIds.length) {
+                      setSelectedTaskId(function (cur) {
+                        return deletedTaskIds.indexOf(cur) !== -1 ? null : cur;
+                      });
+                    }
                     invalidateBoardFetches();
                   }
                 }
@@ -1321,7 +1335,12 @@
                 setTaskEventTick(function (prev) {
                   const next = Object.assign({}, prev);
                   for (const e of msg.events) {
-                    if (e && e.task_id) next[e.task_id] = (next[e.task_id] || 0) + 1;
+                    // `deleted` never ticks: the task row is gone, a reload
+                    // would only fail GET /tasks/:id (_require_task). The
+                    // open drawer is closed directly below instead.
+                    if (e && e.task_id && e.kind !== "deleted") {
+                      next[e.task_id] = (next[e.task_id] || 0) + 1;
+                    }
                   }
                   return next;
                 });
